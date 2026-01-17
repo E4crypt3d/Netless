@@ -9,8 +9,8 @@
 
     const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
     const MAX_DOM_MESSAGES = isMobile ? 25 : 200;
-    const BACKPRESSURE_LIMIT = isMobile ? 32 * 1024 : 256 * 1024;
-    const SEND_TIMEOUT = 30000;
+    const BACKPRESSURE_LIMIT = isMobile ? 32 * 1024 : 512 * 1024;
+    const SEND_TIMEOUT = 60000;
 
     const msgData = new Map();
     const objectUrls = new Set();
@@ -42,17 +42,12 @@
         bindUI();
     }
 
-    function pruneMessages() {
-        const messages = Array.from(chat.querySelectorAll('.message'));
-        if (messages.length <= MAX_DOM_MESSAGES) return;
-        const toRemove = messages.slice(0, messages.length - MAX_DOM_MESSAGES);
-        toRemove.forEach(el => {
-            const mid = el.id.replace('m-', '');
-            const data = msgData.get(mid);
-            if (data?.url) { URL.revokeObjectURL(data.url); objectUrls.delete(data.url); }
-            msgData.delete(mid);
-            el.remove();
-        });
+    function formatSize(bytes) {
+        if (bytes === 0) return '0 B';
+        const k = 1024;
+        const sizes = ['B', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
 
     function handleJson(msg) {
@@ -60,6 +55,13 @@
             case 'identity_confirmed': currentUser = msg.username; nameLabel.textContent = msg.username; break;
             case 'chat': appendChat(msg); break;
             case 'system': appendSystem(msg.text); break;
+            case 'transfer_incoming':
+                if (!document.getElementById(`m-${msg.meta.id}`)) {
+                    if (msg.meta.type === 'voice') appendVoice({ ...msg.meta, loading: true });
+                    else appendFile({ ...msg.meta, loading: true });
+                    updateProgress(msg.meta.id, 0, "Receiving...");
+                }
+                break;
             case 'transfer_progress': updateProgress(msg.messageId, msg.percent); break;
             case 'typing_update':
                 const box = document.getElementById('typing-box');
@@ -74,7 +76,6 @@
                 break;
             case 'reaction': updateReaction(msg); break;
         }
-        pruneMessages();
     }
 
     function bindUI() {
@@ -95,10 +96,8 @@
         fileIn.onchange = (e) => {
             const f = e.target.files[0]; if (!f) return;
             if (f.size > MAX_FILE) { alert('Max 15MB'); return; }
-
-            const meta = { type: 'file', sender: currentUser, id: 'f' + Date.now(), timestamp: Date.now(), name: f.name, mime: f.type };
+            const meta = { type: 'file', sender: currentUser, id: 'f' + Date.now(), timestamp: Date.now(), name: f.name, mime: f.type, size: f.size };
             appendFile({ ...meta, loading: true });
-
             const r = new FileReader();
             r.onload = (ev) => sendBin(meta, ev.target.result);
             r.readAsArrayBuffer(f);
@@ -120,7 +119,7 @@
                 if (audioChunks.length > 0 && !recCanceled && (Date.now() - recStartTime > 600)) {
                     const b = new Blob(audioChunks, { type: m });
                     const buf = await b.arrayBuffer();
-                    const meta = { type: 'voice', sender: currentUser, id: 'v' + Date.now(), timestamp: Date.now(), mime: m };
+                    const meta = { type: 'voice', sender: currentUser, id: 'v' + Date.now(), timestamp: Date.now(), mime: m, size: b.size };
                     appendVoice({ ...meta, loading: true });
                     await sendBin(meta, buf);
                 }
@@ -137,41 +136,27 @@
 
     async function sendBin(meta, data) {
         if (socket.readyState !== 1) return;
-        const sendStartTime = Date.now();
+        const start = Date.now();
         const mBuf = new TextEncoder().encode(JSON.stringify(meta));
         const len = new Uint8Array(4); new DataView(len.buffer).setUint32(0, mBuf.length);
         const pkg = new Blob([len, mBuf, data]);
 
-        // Safety net: hard-stop oversized sends
-        if (pkg.size > MAX_FILE + 1024) return;
-
         const trackUpload = () => {
             const now = Date.now();
             if (socket.readyState === 1 && socket.bufferedAmount > 0) {
-                if (now - sendStartTime > SEND_TIMEOUT) {
-                    updateProgress(meta.id, 0, "Upload Error");
-                    return;
-                }
                 const uploaded = pkg.size - socket.bufferedAmount;
-                const percent = Math.max(0, Math.min(95, Math.floor((uploaded / pkg.size) * 100)));
-
-                // Break infinite loop risk if uplink is stalled or hit 90%
-                if (percent >= 90) return;
-
-                updateProgress(meta.id, percent, "Sending...");
+                const percent = Math.max(0, Math.min(99, Math.floor((uploaded / pkg.size) * 100)));
+                updateProgress(meta.id, percent, "Uploading...");
                 requestAnimationFrame(trackUpload);
             } else if (socket.readyState === 1 && socket.bufferedAmount === 0) {
-                updateProgress(meta.id, 98, "Broadcasting...");
+                updateProgress(meta.id, 100, "Sent");
             }
         };
 
         while (socket.bufferedAmount > BACKPRESSURE_LIMIT) {
-            if (Date.now() - sendStartTime > SEND_TIMEOUT) { console.warn('Send timed out'); return; }
+            if (Date.now() - start > SEND_TIMEOUT) return;
             await new Promise(r => setTimeout(r, 100));
         }
-
-        // Final sanity check for backpressure just before send
-        if (socket.bufferedAmount > BACKPRESSURE_LIMIT) return;
 
         socket.send(pkg);
         requestAnimationFrame(trackUpload);
@@ -198,7 +183,7 @@
         }
 
         bar.style.width = percent + '%';
-        badge.textContent = (label || "Processing...") + ` ${percent}%`;
+        badge.textContent = (label || "Broadcasting...") + ` ${percent}%`;
 
         if (percent >= 100) {
             setTimeout(() => {
@@ -220,18 +205,12 @@
             const content = meta.type === 'voice' ? createVoiceContent(url) : createFileContent(meta, url);
             const placeholder = existing.querySelector('.placeholder-content');
             if (placeholder) existing.replaceChild(content, placeholder);
-            else {
-                const sender = existing.querySelector('.sender-name');
-                if (sender && sender.nextSibling) existing.insertBefore(content, sender.nextSibling);
-            }
             existing.classList.remove('is-loading');
-            const d = msgData.get(meta.id);
-            if (d) d.url = url;
+            msgData.set(meta.id, { reactions: {}, url: url });
         } else {
             msgData.set(meta.id, { reactions: {}, url: url });
             if (meta.type === 'voice') appendVoice({ ...meta, url }); else appendFile({ ...meta, url });
         }
-
         pruneMessages();
     }
 
@@ -243,9 +222,17 @@
         div.onclick = (e) => openReact(e, m.id);
         if (!msgData.has(m.id)) msgData.set(m.id, { reactions: {} });
         const n = document.createElement('span'); n.className = 'sender-name'; n.textContent = isMe ? 'You' : m.sender; n.style.color = getHashColor(m.sender); div.appendChild(n);
+
+        if (m.size) {
+            const sz = document.createElement('small'); sz.className = 'file-size'; sz.textContent = ` (${formatSize(m.size)})`; sz.style.opacity = '0.5'; sz.style.fontSize = '0.6rem';
+            n.appendChild(sz);
+        }
+
         const meta = document.createElement('div'); meta.className = 'message-meta';
         const t = document.createElement('span'); t.textContent = new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); meta.appendChild(t);
-        if (isMe) { const d = document.createElement('button'); d.className = 'delete-btn'; d.textContent = '✕'; d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: m.id })); }; meta.appendChild(d); }
+        if (isMe) {
+            const d = document.createElement('button'); d.className = 'delete-btn'; d.textContent = '✕'; d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: m.id })); }; meta.appendChild(d);
+        }
         div.appendChild(meta); return div;
     }
 
@@ -294,5 +281,19 @@
     function scrollChat() { requestAnimationFrame(() => chat.scrollTop = chat.scrollHeight); }
     function updateTimer() { const d = Math.floor((Date.now() - recStartTime) / 1000); timer.textContent = `${Math.floor(d / 60)}:${(d % 60).toString().padStart(2, '0')}`; }
     function getHashColor(n) { let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return `hsl(${Math.abs(h % 360)}, 50%, 75%)`; }
+
+    function pruneMessages() {
+        const messages = Array.from(chat.querySelectorAll('.message'));
+        if (messages.length <= MAX_DOM_MESSAGES) return;
+        const toRemove = messages.slice(0, messages.length - MAX_DOM_MESSAGES);
+        toRemove.forEach(el => {
+            const mid = el.id.replace('m-', '');
+            const data = msgData.get(mid);
+            if (data?.url) { URL.revokeObjectURL(data.url); objectUrls.delete(data.url); }
+            msgData.delete(mid);
+            el.remove();
+        });
+    }
+
     init();
 })();

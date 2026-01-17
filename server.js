@@ -15,9 +15,8 @@ const PUBLIC_DIR = path.resolve(__dirname, 'public');
 const CERT_DIR = path.resolve(__dirname, 'certs');
 
 const isLowResource = process.env.PREFIX?.includes('com.termux') || os.arch().startsWith('arm');
-const BACKPRESSURE_THRESHOLD = isLowResource ? 64 * 1024 : 512 * 1024;
-const FRAGMENT_SIZE = isLowResource ? 16 * 1024 : 64 * 1024;
-const SEND_TIMEOUT = 30000;
+const BACKPRESSURE_THRESHOLD = isLowResource ? 64 * 1024 : 1024 * 1024;
+const SEND_TIMEOUT = 60000;
 
 if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
@@ -44,7 +43,7 @@ if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
 const server = https.createServer(credentials, app);
 const wss = new WebSocket.Server({
     server,
-    maxPayload: 25 * 1024 * 1024
+    maxPayload: 30 * 1024 * 1024
 });
 
 function getUsers() {
@@ -75,38 +74,30 @@ async function processBinaryQueue() {
 
     let { payload, meta } = binaryBroadcastQueue.shift();
     const targets = Array.from(wss.clients).filter(c => c.readyState === WebSocket.OPEN);
-    const total = payload.byteLength;
     const start = Date.now();
 
-    let lastProgress = -1;
+    // Inform clients that a binary transfer is coming so they can show "Receiving..."
+    broadcastJson({ type: 'transfer_incoming', meta });
 
-    for (let offset = 0; offset < total; offset += FRAGMENT_SIZE) {
-        if (Date.now() - start > SEND_TIMEOUT) break;
+    for (const client of targets) {
+        if (client.readyState !== WebSocket.OPEN) continue;
 
-        const isLast = (offset + FRAGMENT_SIZE) >= total;
-        const chunk = payload.slice(offset, isLast ? total : offset + FRAGMENT_SIZE);
-
-        // Sequential non-blocking broadcast
-        for (const client of targets) {
-            if (client.readyState !== WebSocket.OPEN) continue;
-
-            // Skip slow clients instead of stalling the whole broadcast loop
-            if (client.bufferedAmount > BACKPRESSURE_THRESHOLD) continue;
-
-            // Manual FIN removed to rely on internal ws framing/fragmentation
-            client.send(chunk, { binary: true, compress: false });
+        let clientWaitStart = Date.now();
+        while (client.bufferedAmount > BACKPRESSURE_THRESHOLD) {
+            if (Date.now() - clientWaitStart > 10000) break; // Don't hang forever for one client
+            await new Promise(r => setTimeout(r, 100));
         }
 
-        const progress = Math.floor((offset / total) * 100);
-        if (progress > lastProgress && progress % 10 === 0) {
-            lastProgress = progress;
-            broadcastJson({ type: 'transfer_progress', messageId: meta.id, percent: progress });
-        }
+        // Send payload as a single message to ensure integrity and fix 16KB truncation
+        client.send(payload, { binary: true, compress: false });
 
+        // Small yield to let event loop breathe between large sends
         await new Promise(res => setImmediate(res));
     }
 
+    // Success broadcast
     broadcastJson({ type: 'transfer_progress', messageId: meta.id, percent: 100 });
+
     payload = null;
     isProcessingBinary = false;
     setImmediate(processBinaryQueue);
@@ -119,10 +110,8 @@ function broadcastBinarySafely(data) {
         const meta = JSON.parse(new TextDecoder().decode(data.slice(4, 4 + mLen)));
 
         binaryBroadcastQueue.push({ payload: data, meta });
-        // Clear local reference to free memory pinning
         data = null;
 
-        // Keep current and next potential transfer in queue
         while (binaryBroadcastQueue.length > 2) binaryBroadcastQueue.shift();
         processBinaryQueue();
     } catch (e) {
