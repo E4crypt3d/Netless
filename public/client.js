@@ -2,20 +2,19 @@
 (() => {
     let socket;
     let currentUser = '';
-    let isTyping = false;
-    let typingTimer = null;
-    let isRecording = false;
-    let recCanceled = false;
-    let recStartPos = null;
-    let mediaRecorder = null;
-    let audioChunks = [];
-    let recStartTime = 0;
-    let timerInt = null;
+    let isTyping = false, typingTimer = null;
+    let isRecording = false, recCanceled = false, recStartPos = null;
+    let mediaRecorder = null, audioChunks = [], recStartTime = 0, timerInt = null;
     let reactionMenu = null;
+
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const MAX_DOM_MESSAGES = isMobile ? 25 : 200;
+    const BACKPRESSURE_LIMIT = isMobile ? 64 * 1024 : 256 * 1024;
+    const SEND_TIMEOUT = 10000;
+
     const msgData = new Map();
     const objectUrls = new Set();
     const MAX_FILE = 15 * 1024 * 1024;
-    const BACKPRESSURE_LIMIT = 256 * 1024; // 256KB client-side threshold
     const SYMBOLS = ['❤️', '⭐', '🔥', '😂', '❓'];
 
     const chat = document.getElementById('chat-area');
@@ -32,367 +31,147 @@
     function init() {
         let uid = localStorage.getItem('netless_uid') || ('u' + Date.now() + Math.random().toString(36).substr(2, 5));
         localStorage.setItem('netless_uid', uid);
-
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         try {
             socket = new WebSocket(`${protocol}//${location.host}`);
             socket.binaryType = 'arraybuffer';
-
-            socket.onopen = () => {
-                socket.send(JSON.stringify({ type: 'identify', uid }));
-                statusLight.className = 'status-light online';
-            };
-
-            socket.onmessage = (e) => {
-                if (e.data instanceof ArrayBuffer) handleBinary(e.data);
-                else handleJson(JSON.parse(e.data));
-            };
-
-            socket.onclose = () => {
-                statusLight.className = 'status-light';
-                setTimeout(init, 3000);
-            };
-        } catch (e) {
-            console.error('Socket fail', e);
-        }
-
+            socket.onopen = () => { socket.send(JSON.stringify({ type: 'identify', uid })); statusLight.className = 'status-light online'; };
+            socket.onmessage = (e) => { if (e.data instanceof ArrayBuffer) handleBinary(e.data); else handleJson(JSON.parse(e.data)); };
+            socket.onclose = () => { statusLight.className = 'status-light'; setTimeout(init, 3000); };
+        } catch (e) { console.error('Socket fail', e); }
         bindUI();
+    }
+
+    function pruneMessages() {
+        const messages = Array.from(chat.querySelectorAll('.message'));
+        if (messages.length <= MAX_DOM_MESSAGES) return;
+        const toRemove = messages.slice(0, messages.length - MAX_DOM_MESSAGES);
+        toRemove.forEach(el => {
+            const mid = el.id.replace('m-', '');
+            const data = msgData.get(mid);
+            if (data?.url) { URL.revokeObjectURL(data.url); objectUrls.delete(data.url); }
+            msgData.delete(mid);
+            el.remove();
+        });
     }
 
     function handleJson(msg) {
         switch (msg.type) {
-            case 'identity_confirmed':
-                currentUser = msg.username;
-                nameLabel.textContent = msg.username;
-                break;
-            case 'chat':
-                appendChat(msg);
-                break;
-            case 'system':
-                appendSystem(msg.text);
-                break;
+            case 'identity_confirmed': currentUser = msg.username; nameLabel.textContent = msg.username; break;
+            case 'chat': appendChat(msg); break;
+            case 'system': appendSystem(msg.text); break;
             case 'typing_update':
-                const typingBox = document.getElementById('typing-box');
+                const box = document.getElementById('typing-box');
                 const others = msg.users.filter(u => u !== currentUser);
-                typingBox.textContent = others.length ? `${others.join(', ')} is typing...` : '';
-                typingBox.classList.toggle('hidden', !others.length);
+                box.textContent = others.length ? `${others.join(', ')} typing...` : '';
+                box.classList.toggle('hidden', !others.length);
                 break;
-            case 'name_updated':
-                currentUser = msg.name;
-                nameLabel.textContent = msg.name;
-                break;
+            case 'name_updated': currentUser = msg.name; nameLabel.textContent = msg.name; break;
             case 'delete':
                 const el = document.getElementById(`m-${msg.messageId}`);
-                if (el) el.remove();
+                if (el) { const d = msgData.get(msg.messageId); if (d?.url) URL.revokeObjectURL(d.url); msgData.delete(msg.messageId); el.remove(); }
                 break;
-            case 'reaction':
-                updateReaction(msg);
-                break;
+            case 'reaction': updateReaction(msg); break;
         }
+        pruneMessages();
     }
 
     function bindUI() {
         input.oninput = () => {
-            const hasText = input.value.trim().length > 0;
-            btnSend.classList.toggle('hidden', !hasText);
-            btnRec.classList.toggle('hidden', hasText);
-            input.style.height = 'auto';
-            input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-            handleTyping(hasText);
+            const t = input.value.trim().length > 0;
+            btnSend.classList.toggle('hidden', !t); btnRec.classList.toggle('hidden', t);
+            input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+            handleTyping(t);
         };
-
-        input.onkeydown = (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
-        };
-
+        input.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); } };
         btnSend.onclick = sendText;
-
-        document.getElementById('attach-label').onclick = (e) => {
-            e.preventDefault();
-            fileIn.click();
-        };
-
-        btnRec.onpointerdown = (e) => {
-            e.preventDefault();
-            btnRec.setPointerCapture(e.pointerId);
-            recStartPos = e.clientX;
-            recCanceled = false;
-            startRec();
-        };
-
-        btnRec.onpointermove = (e) => {
-            if (!isRecording) return;
-            if (recStartPos - e.clientX > 60) cancelRec();
-        };
-
-        btnRec.onpointerup = (e) => {
-            if (isRecording) {
-                btnRec.releasePointerCapture(e.pointerId);
-                stopRec();
-            }
-        };
-
-        btnRec.onpointercancel = (e) => {
-            if (isRecording) {
-                btnRec.releasePointerCapture(e.pointerId);
-                cancelRec();
-            }
-        };
-
+        document.getElementById('attach-label').onclick = (e) => { e.preventDefault(); fileIn.click(); };
+        btnRec.onpointerdown = (e) => { e.preventDefault(); btnRec.setPointerCapture(e.pointerId); recStartPos = e.clientX; recCanceled = false; startRec(); };
+        btnRec.onpointermove = (e) => { if (isRecording && recStartPos - e.clientX > 60) cancelRec(); };
+        btnRec.onpointerup = (e) => { if (isRecording) { btnRec.releasePointerCapture(e.pointerId); stopRec(); } };
+        btnRec.onpointercancel = (e) => { if (isRecording) { btnRec.releasePointerCapture(e.pointerId); cancelRec(); } };
         btnRec.oncontextmenu = (e) => e.preventDefault();
-
         fileIn.onchange = (e) => {
-            const f = e.target.files[0];
-            if (!f) return;
+            const f = e.target.files[0]; if (!f) return;
             if (f.size > MAX_FILE) { alert('Max 15MB'); return; }
             const r = new FileReader();
             r.onload = (ev) => sendBin({ type: 'file', sender: currentUser, id: 'f' + Date.now(), timestamp: Date.now(), name: f.name, mime: f.type }, ev.target.result);
             r.readAsArrayBuffer(f);
             fileIn.value = '';
         };
-
-        document.getElementById('edit-btn').onclick = () => {
-            document.getElementById('user-info').classList.add('hidden');
-            const form = document.getElementById('edit-form');
-            form.classList.remove('hidden');
-            const inpt = document.getElementById('name-input');
-            inpt.value = currentUser;
-            inpt.focus();
-        };
-
-        document.getElementById('save-btn').onclick = () => {
-            const val = document.getElementById('name-input').value.trim();
-            if (val && socket.readyState === 1) socket.send(JSON.stringify({ type: 'rename', name: val }));
-            document.getElementById('edit-form').classList.add('hidden');
-            document.getElementById('user-info').classList.remove('hidden');
-        };
-
+        document.getElementById('edit-btn').onclick = () => { document.getElementById('user-info').classList.add('hidden'); const f = document.getElementById('edit-form'); f.classList.remove('hidden'); const i = document.getElementById('name-input'); i.value = currentUser; i.focus(); };
+        document.getElementById('save-btn').onclick = () => { const v = document.getElementById('name-input').value.trim(); if (v && socket.readyState === 1) socket.send(JSON.stringify({ type: 'rename', name: v })); document.getElementById('edit-form').classList.add('hidden'); document.getElementById('user-info').classList.remove('hidden'); };
         window.onclick = () => closeReact();
     }
 
     async function startRec() {
         if (isRecording) return;
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const mime = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find(m => MediaRecorder.isTypeSupported(m)) || '';
-            mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
-            audioChunks = [];
+            const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const m = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find(x => MediaRecorder.isTypeSupported(x)) || '';
+            mediaRecorder = new MediaRecorder(s, { mimeType: m }); audioChunks = [];
             mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
             mediaRecorder.onstop = async () => {
                 if (audioChunks.length > 0 && !recCanceled && (Date.now() - recStartTime > 600)) {
-                    const blob = new Blob(audioChunks, { type: mime });
-                    const buf = await blob.arrayBuffer();
-                    await sendBin({ type: 'voice', sender: currentUser, id: 'v' + Date.now(), timestamp: Date.now(), mime }, buf);
+                    const b = new Blob(audioChunks, { type: m }); const buf = await b.arrayBuffer();
+                    await sendBin({ type: 'voice', sender: currentUser, id: 'v' + Date.now(), timestamp: Date.now(), mime: m }, buf);
                 }
-                stream.getTracks().forEach(t => t.stop());
+                s.getTracks().forEach(t => t.stop());
             };
-            mediaRecorder.start();
-            isRecording = true;
-            recStartTime = Date.now();
-            updateTimer();
-            timerInt = setInterval(updateTimer, 1000);
-            btnRec.classList.add('active');
-            recWrap.classList.remove('hidden');
-            inputWrap.classList.add('hidden');
-        } catch (e) { alert('Mic access denied'); }
+            mediaRecorder.start(); isRecording = true; recStartTime = Date.now();
+            updateTimer(); timerInt = setInterval(updateTimer, 1000);
+            btnRec.classList.add('active'); recWrap.classList.remove('hidden'); inputWrap.classList.add('hidden');
+        } catch (e) { alert('Mic denied'); }
     }
+    function cancelRec() { if (isRecording) { recCanceled = true; stopRec(); } }
+    function stopRec() { if (isRecording) { clearInterval(timerInt); if (mediaRecorder?.state !== 'inactive') mediaRecorder.stop(); isRecording = false; btnRec.classList.remove('active'); recWrap.classList.add('hidden'); inputWrap.classList.remove('hidden'); } }
+    function sendText() { const v = input.value.trim(); if (!v || socket.readyState !== 1) return; socket.send(JSON.stringify({ type: 'chat', text: v })); input.value = ''; input.style.height = 'auto'; btnSend.classList.add('hidden'); btnRec.classList.remove('hidden'); }
 
-    function cancelRec() {
-        if (!isRecording) return;
-        recCanceled = true;
-        stopRec();
-    }
-
-    function stopRec() {
-        if (!isRecording) return;
-        clearInterval(timerInt);
-        if (mediaRecorder?.state !== 'inactive') mediaRecorder.stop();
-        isRecording = false;
-        btnRec.classList.remove('active');
-        recWrap.classList.add('hidden');
-        inputWrap.classList.remove('hidden');
-    }
-
-    function sendText() {
-        const val = input.value.trim();
-        if (!val || socket.readyState !== 1) return;
-        socket.send(JSON.stringify({ type: 'chat', text: val }));
-        input.value = '';
-        input.style.height = 'auto';
-        btnSend.classList.add('hidden');
-        btnRec.classList.remove('hidden');
-    }
-
-    /**
-     * Sends binary data with protocol: [4b metadata length][JSON metadata][Payload]
-     * Uses Blobs to leverage browser's internal streaming/fragmentation.
-     */
     async function sendBin(meta, data) {
         if (socket.readyState !== 1) return;
-
-        // Block until outbound buffer is safe to avoid browser UI lockups
+        const start = Date.now();
         while (socket.bufferedAmount > BACKPRESSURE_LIMIT) {
+            if (Date.now() - start > SEND_TIMEOUT) { console.warn('Send timed out'); return; }
             await new Promise(r => setTimeout(r, 100));
         }
-
         const mBuf = new TextEncoder().encode(JSON.stringify(meta));
-        const len = new Uint8Array(4);
-        new DataView(len.buffer).setUint32(0, mBuf.length);
-
-        // Sequential creation to avoid massive memory spikes
-        const pkg = new Blob([len, mBuf, data]);
-        socket.send(pkg);
+        const len = new Uint8Array(4); new DataView(len.buffer).setUint32(0, mBuf.length);
+        socket.send(new Blob([len, mBuf, data]));
     }
 
     function handleBinary(buf) {
-        const dv = new DataView(buf);
-        const mLen = dv.getUint32(0);
+        const dv = new DataView(buf); const mLen = dv.getUint32(0);
         const meta = JSON.parse(new TextDecoder().decode(buf.slice(4, 4 + mLen)));
-        const data = buf.slice(4 + mLen);
-        const blob = new Blob([data], { type: meta.mime });
-        const url = URL.createObjectURL(blob);
-        objectUrls.add(url);
-
-        // Aggressive ObjectURL revocation for mobile memory stability
-        if (objectUrls.size > 20) {
-            const first = objectUrls.values().next().value;
-            URL.revokeObjectURL(first);
-            objectUrls.delete(first);
-        }
-
-        if (meta.type === 'voice') appendVoice({ ...meta, url });
-        else appendFile({ ...meta, url });
+        const blob = new Blob([buf.slice(4 + mLen)], { type: meta.mime });
+        const url = URL.createObjectURL(blob); objectUrls.add(url);
+        msgData.set(meta.id, { reactions: {}, url: url });
+        if (meta.type === 'voice') appendVoice({ ...meta, url }); else appendFile({ ...meta, url });
+        pruneMessages();
     }
 
     function createMsgBase(m) {
         const isMe = m.sender === currentUser;
-        const div = document.createElement('div');
-        div.id = `m-${m.id}`;
-        div.className = `message ${isMe ? 'msg-right' : 'msg-left'}`;
+        const div = document.createElement('div'); div.id = `m-${m.id}`; div.className = `message ${isMe ? 'msg-right' : 'msg-left'}`;
         div.onclick = (e) => openReact(e, m.id);
-        msgData.set(m.id, { reactions: {} });
-
-        const name = document.createElement('span');
-        name.className = 'sender-name';
-        name.textContent = isMe ? 'You' : m.sender;
-        name.style.color = getHashColor(m.sender);
-        div.appendChild(name);
-
-        const meta = document.createElement('div');
-        meta.className = 'message-meta';
-        const t = document.createElement('span');
-        t.textContent = new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        meta.appendChild(t);
-        if (isMe) {
-            const d = document.createElement('button');
-            d.className = 'delete-btn'; d.textContent = '✕';
-            d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: m.id })); };
-            meta.appendChild(d);
-        }
-        div.appendChild(meta);
-        return div;
+        if (!msgData.has(m.id)) msgData.set(m.id, { reactions: {} });
+        const n = document.createElement('span'); n.className = 'sender-name'; n.textContent = isMe ? 'You' : m.sender; n.style.color = getHashColor(m.sender); div.appendChild(n);
+        const meta = document.createElement('div'); meta.className = 'message-meta';
+        const t = document.createElement('span'); t.textContent = new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); meta.appendChild(t);
+        if (isMe) { const d = document.createElement('button'); d.className = 'delete-btn'; d.textContent = '✕'; d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: m.id })); }; meta.appendChild(d); }
+        div.appendChild(meta); return div;
     }
 
-    function appendChat(m) {
-        const div = createMsgBase(m);
-        const p = document.createElement('p'); p.textContent = m.text;
-        div.insertBefore(p, div.querySelector('.message-meta'));
-        chat.appendChild(div); scrollChat();
-    }
-
-    function appendVoice(m) {
-        const div = createMsgBase(m);
-        const aud = document.createElement('audio');
-        aud.src = m.url; aud.controls = true;
-        // Fix for infinite duration issues on some mobile browsers
-        aud.onloadedmetadata = () => {
-            if (aud.duration === Infinity) {
-                aud.currentTime = 1e101;
-                aud.ontimeupdate = function () { this.ontimeupdate = () => { }; aud.currentTime = 0; };
-            }
-        };
-        div.insertBefore(aud, div.querySelector('.message-meta'));
-        chat.appendChild(div); scrollChat();
-    }
-
-    function appendFile(m) {
-        const div = createMsgBase(m);
-        if (m.mime.startsWith('image/')) {
-            const img = document.createElement('img'); img.src = m.url;
-            img.onclick = (e) => { e.stopPropagation(); window.open(m.url); };
-            div.insertBefore(img, div.querySelector('.message-meta'));
-        } else {
-            const a = document.createElement('a'); a.className = 'file-card';
-            a.href = m.url; a.download = m.name; a.innerHTML = `<span>📎 ${m.name}</span>`;
-            a.onclick = (e) => e.stopPropagation();
-            div.insertBefore(a, div.querySelector('.message-meta'));
-        }
-        chat.appendChild(div); scrollChat();
-    }
-
-    function updateReaction(m) {
-        const data = msgData.get(m.messageId);
-        if (!data) return;
-        const reactions = data.reactions;
-        for (const s in reactions) reactions[s] = reactions[s].filter(u => u !== m.reactor);
-        if (m.symbol) {
-            if (!reactions[m.symbol]) reactions[m.symbol] = [];
-            reactions[m.symbol].push(m.reactor);
-        }
-        renderReacts(m.messageId);
-    }
-
-    function renderReacts(mid) {
-        const el = document.getElementById(`m-${mid}`);
-        const data = msgData.get(mid);
-        if (!el || !data) return;
-        let list = el.querySelector('.reactions-list');
-        if (!list) { list = document.createElement('div'); list.className = 'reactions-list'; el.appendChild(list); }
-        list.innerHTML = '';
-        for (const s in data.reactions) {
-            if (data.reactions[s].length > 0) {
-                const p = document.createElement('div'); p.className = 'react-pill';
-                p.innerHTML = `${s} ${data.reactions[s].length > 1 ? `<small>${data.reactions[s].length}</small>` : ''}`;
-                list.appendChild(p);
-            }
-        }
-    }
-
-    function openReact(e, mid) {
-        e.stopPropagation(); closeReact();
-        const bar = document.createElement('div'); bar.className = 'reaction-bar';
-        SYMBOLS.forEach(s => {
-            const o = document.createElement('span'); o.className = 'react-opt'; o.textContent = s;
-            o.onclick = (ev) => {
-                ev.stopPropagation();
-                socket.send(JSON.stringify({ type: 'reaction', messageId: mid, reactor: currentUser, symbol: s }));
-                closeReact();
-            };
-            bar.appendChild(o);
-        });
-        const r = e.currentTarget.getBoundingClientRect();
-        bar.style.left = `${Math.max(10, Math.min(window.innerWidth - 200, r.left))}px`;
-        bar.style.top = `${r.top > 100 ? r.top - 50 : r.bottom + 10}px`;
-        document.body.appendChild(bar);
-        reactionMenu = bar;
-    }
-
+    function appendChat(m) { const d = createMsgBase(m); const p = document.createElement('p'); p.textContent = m.text; d.insertBefore(p, d.querySelector('.message-meta')); chat.appendChild(d); scrollChat(); }
+    function appendVoice(m) { const d = createMsgBase(m); const a = document.createElement('audio'); a.src = m.url; a.controls = true; a.onloadedmetadata = () => { if (a.duration === Infinity) { a.currentTime = 1e101; a.ontimeupdate = function () { this.ontimeupdate = () => { }; a.currentTime = 0; }; } }; d.insertBefore(a, d.querySelector('.message-meta')); chat.appendChild(d); scrollChat(); }
+    function appendFile(m) { const d = createMsgBase(m); if (m.mime.startsWith('image/')) { const i = document.createElement('img'); i.src = m.url; i.onclick = (e) => { e.stopPropagation(); window.open(m.url); }; d.insertBefore(i, d.querySelector('.message-meta')); } else { const a = document.createElement('a'); a.className = 'file-card'; a.href = m.url; a.download = m.name; a.innerHTML = `<span>📎 ${m.name}</span>`; a.onclick = (e) => e.stopPropagation(); d.insertBefore(a, d.querySelector('.message-meta')); } chat.appendChild(d); scrollChat(); }
+    function updateReaction(m) { const d = msgData.get(m.messageId); if (!d) return; const r = d.reactions; for (const s in r) r[s] = r[s].filter(u => u !== m.reactor); if (m.symbol) { if (!r[m.symbol]) r[m.symbol] = []; r[m.symbol].push(m.reactor); } renderReacts(m.messageId); }
+    function renderReacts(mid) { const el = document.getElementById(`m-${mid}`); const d = msgData.get(mid); if (!el || !d) return; let l = el.querySelector('.reactions-list'); if (!l) { l = document.createElement('div'); l.className = 'reactions-list'; el.appendChild(l); } l.innerHTML = ''; for (const s in d.reactions) if (d.reactions[s].length > 0) { const p = document.createElement('div'); p.className = 'react-pill'; p.innerHTML = `${s} ${d.reactions[s].length > 1 ? `<small>${d.reactions[s].length}</small>` : ''}`; l.appendChild(p); } }
+    function openReact(e, mid) { e.stopPropagation(); closeReact(); const b = document.createElement('div'); b.className = 'reaction-bar'; SYMBOLS.forEach(s => { const o = document.createElement('span'); o.className = 'react-opt'; o.textContent = s; o.onclick = (ev) => { ev.stopPropagation(); socket.send(JSON.stringify({ type: 'reaction', messageId: mid, reactor: currentUser, symbol: s })); closeReact(); }; b.appendChild(o); }); const r = e.currentTarget.getBoundingClientRect(); b.style.left = `${Math.max(10, Math.min(window.innerWidth - 200, r.left))}px`; b.style.top = `${r.top > 100 ? r.top - 50 : r.bottom + 10}px`; document.body.appendChild(b); reactionMenu = b; }
     function closeReact() { if (reactionMenu) { reactionMenu.remove(); reactionMenu = null; } }
-
-    function handleTyping(t) {
-        if (t !== isTyping) { isTyping = t; socket.send(JSON.stringify({ type: 'typing', isTyping: t })); }
-        clearTimeout(typingTimer);
-        if (t) typingTimer = setTimeout(() => handleTyping(false), 3000);
-    }
-
-    function appendSystem(t) {
-        const d = document.createElement('div'); d.className = 'system-msg'; d.textContent = t;
-        chat.appendChild(d); scrollChat();
-    }
-
+    function handleTyping(t) { if (t !== isTyping) { isTyping = t; socket.send(JSON.stringify({ type: 'typing', isTyping: t })); } clearTimeout(typingTimer); if (t) typingTimer = setTimeout(() => handleTyping(false), 3000); }
+    function appendSystem(t) { const d = document.createElement('div'); d.className = 'system-msg'; d.textContent = t; chat.appendChild(d); scrollChat(); }
     function scrollChat() { requestAnimationFrame(() => chat.scrollTop = chat.scrollHeight); }
     function updateTimer() { const d = Math.floor((Date.now() - recStartTime) / 1000); timer.textContent = `${Math.floor(d / 60)}:${(d % 60).toString().padStart(2, '0')}`; }
     function getHashColor(n) { let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return `hsl(${Math.abs(h % 360)}, 50%, 75%)`; }
-
     init();
 })();
