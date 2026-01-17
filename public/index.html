@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; media-src 'self' blob:; img-src 'self' blob: data:; font-src 'self';">
+    <title>Netless LAN</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div id="app" class="app-container">
+        <header class="main-header">
+            <div class="header-left">
+                <div id="status-light" class="status-light"></div>
+                <div class="title-group">
+                    <h1>Netless</h1>
+                    <span id="network-info">LAN Mode</span>
+                </div>
+            </div>
+            <div id="identity-section" class="identity-section">
+                <div id="user-info" class="user-info">
+                    <span id="display-name">...</span>
+                    <button id="edit-btn" class="icon-btn" aria-label="Edit Name">✎</button>
+                </div>
+                <div id="edit-form" class="edit-form hidden">
+                    <input type="text" id="name-input" maxlength="15" spellcheck="false">
+                    <button id="save-btn">OK</button>
+                </div>
+            </div>
+        </header>
+
+        <main id="chat-area" class="chat-area">
+            <div class="welcome-box">
+                <p>Private Local Chat</p>
+                <small>No internet used. No logs stored.</small>
+            </div>
+        </main>
+
+        <div id="typing-box" class="typing-box hidden"></div>
+
+        <footer class="input-footer">
+            <div class="bar-layout">
+                <label for="file-input" class="attach-label" id="attach-label">
+                    <svg viewBox="0 0 24 24">
+                        <path fill="currentColor" d="M19,13H13V19H11V13H5V11H11V5H13V11H19V13Z" />
+                    </svg>
+                </label>
+                <input type="file" id="file-input" class="hidden">
+
+                <div id="text-input-wrap" class="input-wrap">
+                    <textarea id="msg-input" placeholder="Message" rows="1" autocomplete="off"></textarea>
+                </div>
+
+                <div id="rec-wrap" class="rec-wrap hidden">
+                    <div class="rec-indicator">
+                        <div class="pulse-dot"></div>
+                        <span id="timer">0:00</span>
+                    </div>
+                    <span class="slide-tip">← Slide to cancel</span>
+                </div>
+
+                <div class="action-wrap">
+                    <button id="btn-send" class="round-btn hidden" aria-label="Send">
+                        <svg viewBox="0 0 24 24">
+                            <path fill="currentColor" d="M2,21L23,12L2,3V10L17,12L2,14V21Z" />
+                        </svg>
+                    </button>
+                    <button id="btn-rec" class="round-btn" aria-label="Record">
+                        <svg viewBox="0 0 24 24">
+                            <path fill="currentColor"
+                                d="M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M19,11C19,14.53 16.39,17.44 13,17.93V21H11V17.93C7.61,17.44 5,14.53 5,11H7A5,5 0 0,0 12,16A5,5 0 0,0 17,11H19Z" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </footer>
+    </div>
+    <script src="client.js"></script>
+</body>
+
+</html>
