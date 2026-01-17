@@ -14,7 +14,11 @@ const USERS_FILE = path.resolve(__dirname, 'users.json');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
 const CERT_DIR = path.resolve(__dirname, 'certs');
 
-// Ensure directories exist
+// Threshold for WebSocket backpressure (512KB)
+const BACKPRESSURE_THRESHOLD = 512 * 1024;
+// Internal fragmentation size (32KB) - Optimized for Android TCP windows
+const FRAGMENT_SIZE = 32 * 1024;
+
 if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify({}));
@@ -40,7 +44,7 @@ if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
 const server = https.createServer(credentials, app);
 const wss = new WebSocket.Server({
     server,
-    maxPayload: 20 * 1024 * 1024 // 20MB max payload
+    maxPayload: 20 * 1024 * 1024
 });
 
 function getUsers() {
@@ -62,25 +66,68 @@ app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
 
 const clients = new Map();
+const binaryBroadcastQueue = [];
+let isProcessingBinary = false;
 
-wss.on('connection', (ws, req) => {
+/**
+ * Sends a buffer using WebSocket fragmentation (RFC 6455).
+ * Fragmentation is internal; browsers reassemble it before firing 'onmessage'.
+ */
+async function sendInFragments(ws, buffer) {
+    for (let offset = 0; offset < buffer.byteLength; offset += FRAGMENT_SIZE) {
+        const isLast = (offset + FRAGMENT_SIZE) >= buffer.byteLength;
+        const chunk = buffer.slice(offset, offset + FRAGMENT_SIZE);
+
+        // Block until buffer drains - prevents heap-overflow freezes on Termux
+        while (ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
+            await new Promise(r => setTimeout(r, 20));
+        }
+
+        await new Promise(res => ws.send(chunk, {
+            fin: isLast,
+            binary: true,
+            compress: false
+        }, res));
+
+        // Yield to allow system I/O and event loop breathing
+        if (!isLast) await new Promise(res => setImmediate(res));
+    }
+}
+
+async function processBinaryQueue() {
+    if (isProcessingBinary || binaryBroadcastQueue.length === 0) return;
+    isProcessingBinary = true;
+
+    const data = binaryBroadcastQueue.shift();
+    const targetClients = Array.from(wss.clients).filter(c => c.readyState === WebSocket.OPEN);
+
+    for (const client of targetClients) {
+        await sendInFragments(client, data);
+        await new Promise(resolve => setImmediate(resolve));
+    }
+
+    isProcessingBinary = false;
+    processBinaryQueue();
+}
+
+function broadcastBinarySafely(data) {
+    binaryBroadcastQueue.push(data);
+    if (binaryBroadcastQueue.length > 5) binaryBroadcastQueue.shift();
+    processBinaryQueue();
+}
+
+wss.on('connection', (ws) => {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data, isBinary) => {
         if (isBinary) {
-            // High performance binary broadcast
-            setImmediate(() => {
-                wss.clients.forEach(c => {
-                    if (c.readyState === WebSocket.OPEN) c.send(data, { binary: true });
-                });
-            });
+            broadcastBinarySafely(Buffer.isBuffer(data) ? data : Buffer.from(data));
             return;
         }
 
         try {
             const msg = JSON.parse(data.toString());
-
             if (msg.type === 'identify') {
                 const users = getUsers();
                 if (!users[msg.uid]) {
@@ -89,7 +136,6 @@ wss.on('connection', (ws, req) => {
                 }
                 const username = users[msg.uid];
                 clients.set(ws, { uid: msg.uid, username, isTyping: false });
-
                 ws.send(JSON.stringify({ type: 'identity_confirmed', username }));
                 broadcast({ type: 'system', text: `${username} joined` }, ws);
                 return;
@@ -139,16 +185,26 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-function broadcastTypingStatus() {
+async function broadcastTypingStatus() {
     const typingUsers = Array.from(clients.values()).filter(c => c.isTyping).map(c => c.username);
-    broadcast({ type: 'typing_update', users: typingUsers });
+    await broadcast({ type: 'typing_update', users: typingUsers });
 }
 
-function broadcast(data, exclude = null) {
+/**
+ * Async broadcast for JSON to prevent event-loop stalls during fan-out.
+ */
+async function broadcast(data, exclude = null) {
     const payload = JSON.stringify(data);
-    setImmediate(() => {
-        wss.clients.forEach(c => { if (c !== exclude && c.readyState === WebSocket.OPEN) c.send(payload); });
-    });
+    const targets = Array.from(wss.clients).filter(c => c !== exclude && c.readyState === WebSocket.OPEN);
+
+    for (const client of targets) {
+        // Backpressure check - delay rather than skip for critical messages
+        while (client.bufferedAmount > BACKPRESSURE_THRESHOLD) {
+            await new Promise(r => setTimeout(r, 20));
+        }
+        client.send(payload);
+        await new Promise(res => setImmediate(res));
+    }
 }
 
 setInterval(() => {
@@ -169,7 +225,7 @@ for (let k in interfaces) {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`\nNETLESS: LAN Chat Server`);
+    console.log(`\nNETLESS: LAN Chat Server (Fragmentation Mode)`);
     console.log(`Local: https://localhost:${PORT}`);
     addresses.forEach(ip => console.log(`LAN:   https://${ip}:${PORT}`));
 });

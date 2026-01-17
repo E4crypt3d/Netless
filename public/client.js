@@ -5,7 +5,7 @@
     let isTyping = false;
     let typingTimer = null;
     let isRecording = false;
-    let recCanceled = false; // New flag for cancellation
+    let recCanceled = false;
     let recStartPos = null;
     let mediaRecorder = null;
     let audioChunks = [];
@@ -13,7 +13,9 @@
     let timerInt = null;
     let reactionMenu = null;
     const msgData = new Map();
+    const objectUrls = new Set();
     const MAX_FILE = 15 * 1024 * 1024;
+    const BACKPRESSURE_LIMIT = 256 * 1024; // 256KB client-side threshold
     const SYMBOLS = ['❤️', '⭐', '🔥', '😂', '❓'];
 
     const chat = document.getElementById('chat-area');
@@ -105,16 +107,14 @@
 
         btnSend.onclick = sendText;
 
-        // Force label click to trigger input for mobile compatibility
         document.getElementById('attach-label').onclick = (e) => {
             e.preventDefault();
             fileIn.click();
         };
 
-        // Improved Pointer Events for mobile recording
         btnRec.onpointerdown = (e) => {
             e.preventDefault();
-            btnRec.setPointerCapture(e.pointerId); // Crucial for mobile hold/release
+            btnRec.setPointerCapture(e.pointerId);
             recStartPos = e.clientX;
             recCanceled = false;
             startRec();
@@ -122,7 +122,6 @@
 
         btnRec.onpointermove = (e) => {
             if (!isRecording) return;
-            // Swipe left 60px to cancel
             if (recStartPos - e.clientX > 60) cancelRec();
         };
 
@@ -140,7 +139,6 @@
             }
         };
 
-        // Prevent context menu on hold
         btnRec.oncontextmenu = (e) => e.preventDefault();
 
         fileIn.onchange = (e) => {
@@ -181,11 +179,10 @@
             audioChunks = [];
             mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
             mediaRecorder.onstop = async () => {
-                // Check if it was canceled during the recording process
                 if (audioChunks.length > 0 && !recCanceled && (Date.now() - recStartTime > 600)) {
                     const blob = new Blob(audioChunks, { type: mime });
                     const buf = await blob.arrayBuffer();
-                    sendBin({ type: 'voice', sender: currentUser, id: 'v' + Date.now(), timestamp: Date.now(), mime }, buf);
+                    await sendBin({ type: 'voice', sender: currentUser, id: 'v' + Date.now(), timestamp: Date.now(), mime }, buf);
                 }
                 stream.getTracks().forEach(t => t.stop());
             };
@@ -204,7 +201,6 @@
         if (!isRecording) return;
         recCanceled = true;
         stopRec();
-        appendSystem('Voice note cancelled');
     }
 
     function stopRec() {
@@ -227,14 +223,25 @@
         btnRec.classList.remove('hidden');
     }
 
-    function sendBin(meta, data) {
+    /**
+     * Sends binary data with protocol: [4b metadata length][JSON metadata][Payload]
+     * Uses Blobs to leverage browser's internal streaming/fragmentation.
+     */
+    async function sendBin(meta, data) {
         if (socket.readyState !== 1) return;
+
+        // Block until outbound buffer is safe to avoid browser UI lockups
+        while (socket.bufferedAmount > BACKPRESSURE_LIMIT) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+
         const mBuf = new TextEncoder().encode(JSON.stringify(meta));
         const len = new Uint8Array(4);
         new DataView(len.buffer).setUint32(0, mBuf.length);
-        const pkg = new Uint8Array(4 + mBuf.length + data.byteLength);
-        pkg.set(len, 0); pkg.set(mBuf, 4); pkg.set(new Uint8Array(data), 4 + mBuf.length);
-        socket.send(pkg.buffer);
+
+        // Sequential creation to avoid massive memory spikes
+        const pkg = new Blob([len, mBuf, data]);
+        socket.send(pkg);
     }
 
     function handleBinary(buf) {
@@ -242,7 +249,17 @@
         const mLen = dv.getUint32(0);
         const meta = JSON.parse(new TextDecoder().decode(buf.slice(4, 4 + mLen)));
         const data = buf.slice(4 + mLen);
-        const url = URL.createObjectURL(new Blob([data], { type: meta.mime }));
+        const blob = new Blob([data], { type: meta.mime });
+        const url = URL.createObjectURL(blob);
+        objectUrls.add(url);
+
+        // Aggressive ObjectURL revocation for mobile memory stability
+        if (objectUrls.size > 20) {
+            const first = objectUrls.values().next().value;
+            URL.revokeObjectURL(first);
+            objectUrls.delete(first);
+        }
+
         if (meta.type === 'voice') appendVoice({ ...meta, url });
         else appendFile({ ...meta, url });
     }
@@ -287,7 +304,13 @@
         const div = createMsgBase(m);
         const aud = document.createElement('audio');
         aud.src = m.url; aud.controls = true;
-        aud.onloadedmetadata = () => { if (aud.duration === Infinity) { aud.currentTime = 1e101; aud.ontimeupdate = function () { this.ontimeupdate = () => { }; aud.currentTime = 0; }; } };
+        // Fix for infinite duration issues on some mobile browsers
+        aud.onloadedmetadata = () => {
+            if (aud.duration === Infinity) {
+                aud.currentTime = 1e101;
+                aud.ontimeupdate = function () { this.ontimeupdate = () => { }; aud.currentTime = 0; };
+            }
+        };
         div.insertBefore(aud, div.querySelector('.message-meta'));
         chat.appendChild(div); scrollChat();
     }
