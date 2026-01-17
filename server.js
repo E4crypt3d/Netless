@@ -15,9 +15,9 @@ const PUBLIC_DIR = path.resolve(__dirname, 'public');
 const CERT_DIR = path.resolve(__dirname, 'certs');
 
 const isLowResource = process.env.PREFIX?.includes('com.termux') || os.arch().startsWith('arm');
-const BACKPRESSURE_THRESHOLD = isLowResource ? 128 * 1024 : 1024 * 1024;
+const BACKPRESSURE_THRESHOLD = isLowResource ? 64 * 1024 : 512 * 1024;
 const FRAGMENT_SIZE = isLowResource ? 16 * 1024 : 64 * 1024;
-const SEND_TIMEOUT = 15000; // 15s timeout for a single client send
+const SEND_TIMEOUT = 30000;
 
 if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
@@ -44,7 +44,7 @@ if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
 const server = https.createServer(credentials, app);
 const wss = new WebSocket.Server({
     server,
-    maxPayload: 20 * 1024 * 1024
+    maxPayload: 25 * 1024 * 1024
 });
 
 function getUsers() {
@@ -69,50 +69,88 @@ const clients = new Map();
 const binaryBroadcastQueue = [];
 let isProcessingBinary = false;
 
-async function sendInFragments(ws, buffer) {
-    const total = buffer.byteLength;
-    const start = Date.now();
-    for (let offset = 0; offset < total; offset += FRAGMENT_SIZE) {
-        if (ws.readyState !== WebSocket.OPEN || (Date.now() - start > SEND_TIMEOUT)) break;
-        const isLast = (offset + FRAGMENT_SIZE) >= total;
-        const chunk = buffer.slice(offset, isLast ? total : offset + FRAGMENT_SIZE);
-        while (ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
-            if (Date.now() - start > SEND_TIMEOUT) return;
-            await new Promise(r => setTimeout(r, 40));
-        }
-        await new Promise(res => ws.send(chunk, { fin: isLast, binary: true, compress: false }, res));
-        if (!isLast) await new Promise(res => setImmediate(res));
-    }
-}
-
 async function processBinaryQueue() {
     if (isProcessingBinary || binaryBroadcastQueue.length === 0) return;
     isProcessingBinary = true;
-    let payload = binaryBroadcastQueue.shift();
+
+    let { payload, meta } = binaryBroadcastQueue.shift();
     const targets = Array.from(wss.clients).filter(c => c.readyState === WebSocket.OPEN);
-    for (const client of targets) {
-        await sendInFragments(client, payload);
+    const total = payload.byteLength;
+    const start = Date.now();
+
+    let lastProgress = -1;
+
+    for (let offset = 0; offset < total; offset += FRAGMENT_SIZE) {
+        if (Date.now() - start > SEND_TIMEOUT) break;
+
+        const isLast = (offset + FRAGMENT_SIZE) >= total;
+        const chunk = payload.slice(offset, isLast ? total : offset + FRAGMENT_SIZE);
+
+        // Sequential non-blocking broadcast
+        for (const client of targets) {
+            if (client.readyState !== WebSocket.OPEN) continue;
+
+            // Skip slow clients instead of stalling the whole broadcast loop
+            if (client.bufferedAmount > BACKPRESSURE_THRESHOLD) continue;
+
+            // Manual FIN removed to rely on internal ws framing/fragmentation
+            client.send(chunk, { binary: true, compress: false });
+        }
+
+        const progress = Math.floor((offset / total) * 100);
+        if (progress > lastProgress && progress % 10 === 0) {
+            lastProgress = progress;
+            broadcastJson({ type: 'transfer_progress', messageId: meta.id, percent: progress });
+        }
+
         await new Promise(res => setImmediate(res));
     }
+
+    broadcastJson({ type: 'transfer_progress', messageId: meta.id, percent: 100 });
     payload = null;
     isProcessingBinary = false;
     setImmediate(processBinaryQueue);
 }
 
 function broadcastBinarySafely(data) {
-    binaryBroadcastQueue.push(data);
-    while (binaryBroadcastQueue.length > 1) binaryBroadcastQueue.shift();
-    processBinaryQueue();
+    try {
+        const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        const mLen = dv.getUint32(0);
+        const meta = JSON.parse(new TextDecoder().decode(data.slice(4, 4 + mLen)));
+
+        binaryBroadcastQueue.push({ payload: data, meta });
+        // Clear local reference to free memory pinning
+        data = null;
+
+        // Keep current and next potential transfer in queue
+        while (binaryBroadcastQueue.length > 2) binaryBroadcastQueue.shift();
+        processBinaryQueue();
+    } catch (e) {
+        console.error("Binary metadata extraction failed", e);
+    }
+}
+
+async function broadcastJson(data, exclude = null) {
+    const payload = JSON.stringify(data);
+    for (const client of wss.clients) {
+        if (client !== exclude && client.readyState === WebSocket.OPEN) {
+            if (client.bufferedAmount < BACKPRESSURE_THRESHOLD) {
+                client.send(payload);
+            }
+        }
+    }
 }
 
 wss.on('connection', (ws) => {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
+
     ws.on('message', (data, isBinary) => {
         if (isBinary) {
             broadcastBinarySafely(Buffer.isBuffer(data) ? data : Buffer.from(data));
             return;
         }
+
         try {
             const msg = JSON.parse(data.toString());
             if (msg.type === 'identify') {
@@ -121,15 +159,17 @@ wss.on('connection', (ws) => {
                 const username = users[msg.uid];
                 clients.set(ws, { uid: msg.uid, username, isTyping: false });
                 ws.send(JSON.stringify({ type: 'identity_confirmed', username }));
-                broadcast({ type: 'system', text: `${username} joined` }, ws);
+                broadcastJson({ type: 'system', text: `${username} joined` }, ws);
                 return;
             }
+
             const info = clients.get(ws);
             if (!info) return;
+
             if (msg.type === 'chat') {
                 info.isTyping = false;
                 broadcastTypingStatus();
-                broadcast({ type: 'chat', id: 'm-' + Date.now(), sender: info.username, text: msg.text, timestamp: Date.now() });
+                broadcastJson({ type: 'chat', id: 'm-' + Date.now(), sender: info.username, text: msg.text, timestamp: Date.now() });
             } else if (msg.type === 'typing') {
                 info.isTyping = msg.isTyping;
                 broadcastTypingStatus();
@@ -139,38 +179,29 @@ wss.on('connection', (ws) => {
                 if (next && next !== old) {
                     const users = getUsers();
                     info.username = next; users[info.uid] = next; saveUsers(users);
-                    broadcast({ type: 'system', text: `${old} is now ${next}` });
+                    broadcastJson({ type: 'system', text: `${old} is now ${next}` });
                     ws.send(JSON.stringify({ type: 'name_updated', name: next }));
                     broadcastTypingStatus();
                 }
             } else if (msg.type === 'delete' || msg.type === 'reaction') {
-                broadcast(msg);
+                broadcastJson(msg);
             }
         } catch (e) { }
     });
+
     ws.on('close', () => {
         const info = clients.get(ws);
-        if (info) { broadcast({ type: 'system', text: `${info.username} left` }); clients.delete(ws); broadcastTypingStatus(); }
+        if (info) {
+            broadcastJson({ type: 'system', text: `${info.username} left` });
+            clients.delete(ws);
+            broadcastTypingStatus();
+        }
     });
 });
 
-async function broadcastTypingStatus() {
+function broadcastTypingStatus() {
     const users = Array.from(clients.values()).filter(c => c.isTyping).map(c => c.username);
-    await broadcast({ type: 'typing_update', users });
-}
-
-async function broadcast(data, exclude = null) {
-    const payload = JSON.stringify(data);
-    const targets = Array.from(wss.clients).filter(c => c !== exclude && c.readyState === WebSocket.OPEN);
-    for (const client of targets) {
-        const start = Date.now();
-        while (client.bufferedAmount > BACKPRESSURE_THRESHOLD) {
-            if (Date.now() - start > 5000) break;
-            await new Promise(r => setTimeout(r, 30));
-        }
-        client.send(payload);
-        await new Promise(res => setImmediate(res));
-    }
+    broadcastJson({ type: 'typing_update', users });
 }
 
 setInterval(() => {

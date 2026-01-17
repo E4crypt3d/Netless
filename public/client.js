@@ -9,8 +9,8 @@
 
     const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
     const MAX_DOM_MESSAGES = isMobile ? 25 : 200;
-    const BACKPRESSURE_LIMIT = isMobile ? 64 * 1024 : 256 * 1024;
-    const SEND_TIMEOUT = 10000;
+    const BACKPRESSURE_LIMIT = isMobile ? 32 * 1024 : 256 * 1024;
+    const SEND_TIMEOUT = 30000;
 
     const msgData = new Map();
     const objectUrls = new Set();
@@ -60,6 +60,7 @@
             case 'identity_confirmed': currentUser = msg.username; nameLabel.textContent = msg.username; break;
             case 'chat': appendChat(msg); break;
             case 'system': appendSystem(msg.text); break;
+            case 'transfer_progress': updateProgress(msg.messageId, msg.percent); break;
             case 'typing_update':
                 const box = document.getElementById('typing-box');
                 const others = msg.users.filter(u => u !== currentUser);
@@ -94,8 +95,12 @@
         fileIn.onchange = (e) => {
             const f = e.target.files[0]; if (!f) return;
             if (f.size > MAX_FILE) { alert('Max 15MB'); return; }
+
+            const meta = { type: 'file', sender: currentUser, id: 'f' + Date.now(), timestamp: Date.now(), name: f.name, mime: f.type };
+            appendFile({ ...meta, loading: true });
+
             const r = new FileReader();
-            r.onload = (ev) => sendBin({ type: 'file', sender: currentUser, id: 'f' + Date.now(), timestamp: Date.now(), name: f.name, mime: f.type }, ev.target.result);
+            r.onload = (ev) => sendBin(meta, ev.target.result);
             r.readAsArrayBuffer(f);
             fileIn.value = '';
         };
@@ -113,8 +118,11 @@
             mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
             mediaRecorder.onstop = async () => {
                 if (audioChunks.length > 0 && !recCanceled && (Date.now() - recStartTime > 600)) {
-                    const b = new Blob(audioChunks, { type: m }); const buf = await b.arrayBuffer();
-                    await sendBin({ type: 'voice', sender: currentUser, id: 'v' + Date.now(), timestamp: Date.now(), mime: m }, buf);
+                    const b = new Blob(audioChunks, { type: m });
+                    const buf = await b.arrayBuffer();
+                    const meta = { type: 'voice', sender: currentUser, id: 'v' + Date.now(), timestamp: Date.now(), mime: m };
+                    appendVoice({ ...meta, loading: true });
+                    await sendBin(meta, buf);
                 }
                 s.getTracks().forEach(t => t.stop());
             };
@@ -129,14 +137,76 @@
 
     async function sendBin(meta, data) {
         if (socket.readyState !== 1) return;
-        const start = Date.now();
-        while (socket.bufferedAmount > BACKPRESSURE_LIMIT) {
-            if (Date.now() - start > SEND_TIMEOUT) { console.warn('Send timed out'); return; }
-            await new Promise(r => setTimeout(r, 100));
-        }
+        const sendStartTime = Date.now();
         const mBuf = new TextEncoder().encode(JSON.stringify(meta));
         const len = new Uint8Array(4); new DataView(len.buffer).setUint32(0, mBuf.length);
-        socket.send(new Blob([len, mBuf, data]));
+        const pkg = new Blob([len, mBuf, data]);
+
+        // Safety net: hard-stop oversized sends
+        if (pkg.size > MAX_FILE + 1024) return;
+
+        const trackUpload = () => {
+            const now = Date.now();
+            if (socket.readyState === 1 && socket.bufferedAmount > 0) {
+                if (now - sendStartTime > SEND_TIMEOUT) {
+                    updateProgress(meta.id, 0, "Upload Error");
+                    return;
+                }
+                const uploaded = pkg.size - socket.bufferedAmount;
+                const percent = Math.max(0, Math.min(95, Math.floor((uploaded / pkg.size) * 100)));
+
+                // Break infinite loop risk if uplink is stalled or hit 90%
+                if (percent >= 90) return;
+
+                updateProgress(meta.id, percent, "Sending...");
+                requestAnimationFrame(trackUpload);
+            } else if (socket.readyState === 1 && socket.bufferedAmount === 0) {
+                updateProgress(meta.id, 98, "Broadcasting...");
+            }
+        };
+
+        while (socket.bufferedAmount > BACKPRESSURE_LIMIT) {
+            if (Date.now() - sendStartTime > SEND_TIMEOUT) { console.warn('Send timed out'); return; }
+            await new Promise(r => setTimeout(r, 100));
+        }
+
+        // Final sanity check for backpressure just before send
+        if (socket.bufferedAmount > BACKPRESSURE_LIMIT) return;
+
+        socket.send(pkg);
+        requestAnimationFrame(trackUpload);
+    }
+
+    function updateProgress(mid, percent, label) {
+        const el = document.getElementById(`m-${mid}`);
+        if (!el) return;
+
+        let bar = el.querySelector('.progress-bar-fill');
+        let badge = el.querySelector('.progress-badge');
+
+        if (!bar) {
+            const container = document.createElement('div');
+            container.className = 'progress-container';
+            bar = document.createElement('div');
+            bar.className = 'progress-bar-fill';
+            container.appendChild(bar);
+            el.appendChild(container);
+
+            badge = document.createElement('div');
+            badge.className = 'progress-badge';
+            el.appendChild(badge);
+        }
+
+        bar.style.width = percent + '%';
+        badge.textContent = (label || "Processing...") + ` ${percent}%`;
+
+        if (percent >= 100) {
+            setTimeout(() => {
+                bar.parentElement?.remove();
+                badge?.remove();
+                el.classList.remove('is-loading');
+            }, 1000);
+        }
     }
 
     function handleBinary(buf) {
@@ -144,14 +214,32 @@
         const meta = JSON.parse(new TextDecoder().decode(buf.slice(4, 4 + mLen)));
         const blob = new Blob([buf.slice(4 + mLen)], { type: meta.mime });
         const url = URL.createObjectURL(blob); objectUrls.add(url);
-        msgData.set(meta.id, { reactions: {}, url: url });
-        if (meta.type === 'voice') appendVoice({ ...meta, url }); else appendFile({ ...meta, url });
+
+        const existing = document.getElementById(`m-${meta.id}`);
+        if (existing) {
+            const content = meta.type === 'voice' ? createVoiceContent(url) : createFileContent(meta, url);
+            const placeholder = existing.querySelector('.placeholder-content');
+            if (placeholder) existing.replaceChild(content, placeholder);
+            else {
+                const sender = existing.querySelector('.sender-name');
+                if (sender && sender.nextSibling) existing.insertBefore(content, sender.nextSibling);
+            }
+            existing.classList.remove('is-loading');
+            const d = msgData.get(meta.id);
+            if (d) d.url = url;
+        } else {
+            msgData.set(meta.id, { reactions: {}, url: url });
+            if (meta.type === 'voice') appendVoice({ ...meta, url }); else appendFile({ ...meta, url });
+        }
+
         pruneMessages();
     }
 
     function createMsgBase(m) {
         const isMe = m.sender === currentUser;
         const div = document.createElement('div'); div.id = `m-${m.id}`; div.className = `message ${isMe ? 'msg-right' : 'msg-left'}`;
+        if (m.loading) div.classList.add('is-loading');
+
         div.onclick = (e) => openReact(e, m.id);
         if (!msgData.has(m.id)) msgData.set(m.id, { reactions: {} });
         const n = document.createElement('span'); n.className = 'sender-name'; n.textContent = isMe ? 'You' : m.sender; n.style.color = getHashColor(m.sender); div.appendChild(n);
@@ -161,9 +249,42 @@
         div.appendChild(meta); return div;
     }
 
+    function createVoiceContent(url) {
+        const a = document.createElement('audio'); a.src = url; a.controls = true;
+        a.onloadedmetadata = () => { if (a.duration === Infinity) { a.currentTime = 1e101; a.ontimeupdate = function () { this.ontimeupdate = () => { }; a.currentTime = 0; }; } };
+        return a;
+    }
+
+    function createFileContent(m, url) {
+        if (m.mime && m.mime.startsWith('image/')) {
+            const i = document.createElement('img'); i.src = url; i.onclick = (e) => { e.stopPropagation(); window.open(url); }; return i;
+        } else {
+            const a = document.createElement('a'); a.className = 'file-card'; a.href = url; a.download = m.name; a.innerHTML = `<span>📎 ${m.name}</span>`; a.onclick = (e) => e.stopPropagation(); return a;
+        }
+    }
+
     function appendChat(m) { const d = createMsgBase(m); const p = document.createElement('p'); p.textContent = m.text; d.insertBefore(p, d.querySelector('.message-meta')); chat.appendChild(d); scrollChat(); }
-    function appendVoice(m) { const d = createMsgBase(m); const a = document.createElement('audio'); a.src = m.url; a.controls = true; a.onloadedmetadata = () => { if (a.duration === Infinity) { a.currentTime = 1e101; a.ontimeupdate = function () { this.ontimeupdate = () => { }; a.currentTime = 0; }; } }; d.insertBefore(a, d.querySelector('.message-meta')); chat.appendChild(d); scrollChat(); }
-    function appendFile(m) { const d = createMsgBase(m); if (m.mime.startsWith('image/')) { const i = document.createElement('img'); i.src = m.url; i.onclick = (e) => { e.stopPropagation(); window.open(m.url); }; d.insertBefore(i, d.querySelector('.message-meta')); } else { const a = document.createElement('a'); a.className = 'file-card'; a.href = m.url; a.download = m.name; a.innerHTML = `<span>📎 ${m.name}</span>`; a.onclick = (e) => e.stopPropagation(); d.insertBefore(a, d.querySelector('.message-meta')); } chat.appendChild(d); scrollChat(); }
+    function appendVoice(m) {
+        const d = createMsgBase(m);
+        if (m.loading) {
+            const p = document.createElement('div'); p.className = 'placeholder-content'; p.textContent = "Voice Note...";
+            d.insertBefore(p, d.querySelector('.message-meta'));
+        } else {
+            d.insertBefore(createVoiceContent(m.url), d.querySelector('.message-meta'));
+        }
+        chat.appendChild(d); scrollChat();
+    }
+    function appendFile(m) {
+        const d = createMsgBase(m);
+        if (m.loading) {
+            const p = document.createElement('div'); p.className = 'placeholder-content'; p.textContent = m.name;
+            d.insertBefore(p, d.querySelector('.message-meta'));
+        } else {
+            d.insertBefore(createFileContent(m, m.url), d.querySelector('.message-meta'));
+        }
+        chat.appendChild(d); scrollChat();
+    }
+
     function updateReaction(m) { const d = msgData.get(m.messageId); if (!d) return; const r = d.reactions; for (const s in r) r[s] = r[s].filter(u => u !== m.reactor); if (m.symbol) { if (!r[m.symbol]) r[m.symbol] = []; r[m.symbol].push(m.reactor); } renderReacts(m.messageId); }
     function renderReacts(mid) { const el = document.getElementById(`m-${mid}`); const d = msgData.get(mid); if (!el || !d) return; let l = el.querySelector('.reactions-list'); if (!l) { l = document.createElement('div'); l.className = 'reactions-list'; el.appendChild(l); } l.innerHTML = ''; for (const s in d.reactions) if (d.reactions[s].length > 0) { const p = document.createElement('div'); p.className = 'react-pill'; p.innerHTML = `${s} ${d.reactions[s].length > 1 ? `<small>${d.reactions[s].length}</small>` : ''}`; l.appendChild(p); } }
     function openReact(e, mid) { e.stopPropagation(); closeReact(); const b = document.createElement('div'); b.className = 'reaction-bar'; SYMBOLS.forEach(s => { const o = document.createElement('span'); o.className = 'react-opt'; o.textContent = s; o.onclick = (ev) => { ev.stopPropagation(); socket.send(JSON.stringify({ type: 'reaction', messageId: mid, reactor: currentUser, symbol: s })); closeReact(); }; b.appendChild(o); }); const r = e.currentTarget.getBoundingClientRect(); b.style.left = `${Math.max(10, Math.min(window.innerWidth - 200, r.left))}px`; b.style.top = `${r.top > 100 ? r.top - 50 : r.bottom + 10}px`; document.body.appendChild(b); reactionMenu = b; }

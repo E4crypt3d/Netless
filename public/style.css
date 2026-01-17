@@ -392,6 +392,43 @@ audio {
     font-size: 0.7rem;
 }
 
+/* Progress Styling */
+.progress-container {
+    width: 100%;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 3px;
+    margin-top: 8px;
+    overflow: hidden;
+}
+
+.progress-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.3s ease-out;
+}
+
+.progress-badge {
+    font-size: 0.6rem;
+    color: var(--accent);
+    font-weight: bold;
+    margin-top: 4px;
+    display: block;
+    text-align: right;
+    text-transform: uppercase;
+}
+
+.is-loading {
+    opacity: 0.7;
+}
+
+.placeholder-content {
+    font-style: italic;
+    color: var(--dim);
+    padding: 4px 0;
+}
+
 .hidden {
     display: none !important;
 }
