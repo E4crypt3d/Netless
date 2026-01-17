@@ -28,6 +28,10 @@
     const fileIn = document.getElementById('file-input');
     const statusLight = document.getElementById('status-light');
 
+    const TICK_CLOCK = `<svg class="tick-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22C6.47,22 2,17.5 2,12A10,10 0 0,1 12,2M12.5,7V12.25L17,14.92L16.25,16.15L11,13V7H12.5Z" /></svg>`;
+    const TICK_SINGLE = `<svg class="tick-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z" /></svg>`;
+    const TICK_DOUBLE = `<svg class="tick-icon delivered" viewBox="0 0 24 24"><path fill="currentColor" d="M0.41,13.41L6,19L7.41,17.58L1.83,12M22.24,5.58L11.66,16.17L7.5,12L6.07,13.41L11.66,19L23.66,7M18,7L16.59,5.58L10.24,11.93L11.66,13.34L18,7Z" /></svg>`;
+
     function init() {
         let uid = localStorage.getItem('netless_uid') || ('u' + Date.now() + Math.random().toString(36).substr(2, 5));
         localStorage.setItem('netless_uid', uid);
@@ -53,16 +57,34 @@
     function handleJson(msg) {
         switch (msg.type) {
             case 'identity_confirmed': currentUser = msg.username; nameLabel.textContent = msg.username; break;
-            case 'chat': appendChat(msg); break;
-            case 'system': appendSystem(msg.text); break;
-            case 'transfer_incoming':
-                if (!document.getElementById(`m-${msg.meta.id}`)) {
-                    if (msg.meta.type === 'voice') appendVoice({ ...msg.meta, loading: true });
-                    else appendFile({ ...msg.meta, loading: true });
-                    updateProgress(msg.meta.id, 0, "Receiving...");
+            case 'chat':
+                const existing = document.getElementById(msg.id);
+                if (existing) {
+                    updateMsgStatus(msg.id, 'delivered');
+                } else {
+                    appendChat(msg);
                 }
                 break;
-            case 'transfer_progress': updateProgress(msg.messageId, msg.percent); break;
+            case 'system': appendSystem(msg.text); break;
+            case 'transfer_incoming':
+                if (!document.getElementById(msg.meta.id)) {
+                    if (msg.meta.type === 'voice') appendVoice({ ...msg.meta, loading: true });
+                    else appendFile({ ...msg.meta, loading: true });
+                }
+                break;
+            case 'transfer_progress':
+                const el = document.getElementById(msg.messageId);
+                const isMe = el && el.classList.contains('msg-right');
+
+                // Only show/update progress bar for the sender
+                if (isMe) {
+                    updateProgress(msg.messageId, msg.percent, msg.percent < 100 ? "Broadcasting" : "Sent");
+                }
+
+                if (msg.percent >= 100) {
+                    updateMsgStatus(msg.messageId, 'delivered');
+                }
+                break;
             case 'typing_update':
                 const box = document.getElementById('typing-box');
                 const others = msg.users.filter(u => u !== currentUser);
@@ -71,11 +93,21 @@
                 break;
             case 'name_updated': currentUser = msg.name; nameLabel.textContent = msg.name; break;
             case 'delete':
-                const el = document.getElementById(`m-${msg.messageId}`);
-                if (el) { const d = msgData.get(msg.messageId); if (d?.url) URL.revokeObjectURL(d.url); msgData.delete(msg.messageId); el.remove(); }
+                const delEl = document.getElementById(msg.messageId);
+                if (delEl) { const d = msgData.get(msg.messageId); if (d?.url) URL.revokeObjectURL(d.url); msgData.delete(msg.messageId); delEl.remove(); }
                 break;
             case 'reaction': updateReaction(msg); break;
         }
+    }
+
+    function updateMsgStatus(mid, status) {
+        const el = document.getElementById(mid);
+        if (!el) return;
+        const ticks = el.querySelector('.status-ticks');
+        if (!ticks) return;
+
+        if (status === 'sent') ticks.innerHTML = TICK_SINGLE;
+        else if (status === 'delivered') ticks.innerHTML = TICK_DOUBLE;
     }
 
     function bindUI() {
@@ -96,8 +128,8 @@
         fileIn.onchange = (e) => {
             const f = e.target.files[0]; if (!f) return;
             if (f.size > MAX_FILE) { alert('Max 15MB'); return; }
-            const meta = { type: 'file', sender: currentUser, id: 'f' + Date.now(), timestamp: Date.now(), name: f.name, mime: f.type, size: f.size };
-            appendFile({ ...meta, loading: true });
+            const meta = { type: 'file', sender: currentUser, id: 'm-f' + Date.now(), timestamp: Date.now(), name: f.name, mime: f.type, size: f.size };
+            appendFile({ ...meta, loading: true, status: 'pending' });
             const r = new FileReader();
             r.onload = (ev) => sendBin(meta, ev.target.result);
             r.readAsArrayBuffer(f);
@@ -119,8 +151,8 @@
                 if (audioChunks.length > 0 && !recCanceled && (Date.now() - recStartTime > 600)) {
                     const b = new Blob(audioChunks, { type: m });
                     const buf = await b.arrayBuffer();
-                    const meta = { type: 'voice', sender: currentUser, id: 'v' + Date.now(), timestamp: Date.now(), mime: m, size: b.size };
-                    appendVoice({ ...meta, loading: true });
+                    const meta = { type: 'voice', sender: currentUser, id: 'm-v' + Date.now(), timestamp: Date.now(), mime: m, size: b.size };
+                    appendVoice({ ...meta, loading: true, status: 'pending' });
                     await sendBin(meta, buf);
                 }
                 s.getTracks().forEach(t => t.stop());
@@ -132,7 +164,16 @@
     }
     function cancelRec() { if (isRecording) { recCanceled = true; stopRec(); } }
     function stopRec() { if (isRecording) { clearInterval(timerInt); if (mediaRecorder?.state !== 'inactive') mediaRecorder.stop(); isRecording = false; btnRec.classList.remove('active'); recWrap.classList.add('hidden'); inputWrap.classList.remove('hidden'); } }
-    function sendText() { const v = input.value.trim(); if (!v || socket.readyState !== 1) return; socket.send(JSON.stringify({ type: 'chat', text: v })); input.value = ''; input.style.height = 'auto'; btnSend.classList.add('hidden'); btnRec.classList.remove('hidden'); }
+
+    function sendText() {
+        const v = input.value.trim();
+        if (!v || socket.readyState !== 1) return;
+        const id = 'm-' + Date.now();
+        const msg = { type: 'chat', text: v, sender: currentUser, id, timestamp: Date.now(), status: 'pending' };
+        appendChat(msg);
+        socket.send(JSON.stringify({ type: 'chat', text: v, id }));
+        input.value = ''; input.style.height = 'auto'; btnSend.classList.add('hidden'); btnRec.classList.remove('hidden');
+    }
 
     async function sendBin(meta, data) {
         if (socket.readyState !== 1) return;
@@ -142,14 +183,14 @@
         const pkg = new Blob([len, mBuf, data]);
 
         const trackUpload = () => {
-            const now = Date.now();
             if (socket.readyState === 1 && socket.bufferedAmount > 0) {
                 const uploaded = pkg.size - socket.bufferedAmount;
                 const percent = Math.max(0, Math.min(99, Math.floor((uploaded / pkg.size) * 100)));
-                updateProgress(meta.id, percent, "Uploading...");
+                updateProgress(meta.id, percent, "Uploading");
                 requestAnimationFrame(trackUpload);
             } else if (socket.readyState === 1 && socket.bufferedAmount === 0) {
                 updateProgress(meta.id, 100, "Sent");
+                updateMsgStatus(meta.id, 'sent');
             }
         };
 
@@ -163,8 +204,11 @@
     }
 
     function updateProgress(mid, percent, label) {
-        const el = document.getElementById(`m-${mid}`);
+        const el = document.getElementById(mid);
         if (!el) return;
+
+        // Safety check: Only show progress for uploader
+        if (!el.classList.contains('msg-right')) return;
 
         let bar = el.querySelector('.progress-bar-fill');
         let badge = el.querySelector('.progress-badge');
@@ -183,7 +227,7 @@
         }
 
         bar.style.width = percent + '%';
-        badge.textContent = (label || "Broadcasting...") + ` ${percent}%`;
+        badge.textContent = `${label || "Uploading"} ${percent}%`;
 
         if (percent >= 100) {
             setTimeout(() => {
@@ -200,7 +244,7 @@
         const blob = new Blob([buf.slice(4 + mLen)], { type: meta.mime });
         const url = URL.createObjectURL(blob); objectUrls.add(url);
 
-        const existing = document.getElementById(`m-${meta.id}`);
+        const existing = document.getElementById(meta.id);
         if (existing) {
             const content = meta.type === 'voice' ? createVoiceContent(url) : createFileContent(meta, url);
             const placeholder = existing.querySelector('.placeholder-content');
@@ -216,7 +260,7 @@
 
     function createMsgBase(m) {
         const isMe = m.sender === currentUser;
-        const div = document.createElement('div'); div.id = `m-${m.id}`; div.className = `message ${isMe ? 'msg-right' : 'msg-left'}`;
+        const div = document.createElement('div'); div.id = m.id; div.className = `message ${isMe ? 'msg-right' : 'msg-left'}`;
         if (m.loading) div.classList.add('is-loading');
 
         div.onclick = (e) => openReact(e, m.id);
@@ -229,10 +273,18 @@
         }
 
         const meta = document.createElement('div'); meta.className = 'message-meta';
-        const t = document.createElement('span'); t.textContent = new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); meta.appendChild(t);
+        const t = document.createElement('span'); t.className = 'timestamp'; t.textContent = new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); meta.appendChild(t);
+
         if (isMe) {
-            const d = document.createElement('button'); d.className = 'delete-btn'; d.textContent = '✕'; d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: m.id })); }; meta.appendChild(d);
+            const ticks = document.createElement('span');
+            ticks.className = 'status-ticks';
+            ticks.innerHTML = m.status === 'pending' ? TICK_CLOCK : TICK_SINGLE;
+            meta.appendChild(ticks);
+
+            const d = document.createElement('button'); d.className = 'delete-btn'; d.textContent = '✕'; d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: m.id })); };
+            meta.insertBefore(d, t);
         }
+
         div.appendChild(meta); return div;
     }
 
@@ -273,7 +325,7 @@
     }
 
     function updateReaction(m) { const d = msgData.get(m.messageId); if (!d) return; const r = d.reactions; for (const s in r) r[s] = r[s].filter(u => u !== m.reactor); if (m.symbol) { if (!r[m.symbol]) r[m.symbol] = []; r[m.symbol].push(m.reactor); } renderReacts(m.messageId); }
-    function renderReacts(mid) { const el = document.getElementById(`m-${mid}`); const d = msgData.get(mid); if (!el || !d) return; let l = el.querySelector('.reactions-list'); if (!l) { l = document.createElement('div'); l.className = 'reactions-list'; el.appendChild(l); } l.innerHTML = ''; for (const s in d.reactions) if (d.reactions[s].length > 0) { const p = document.createElement('div'); p.className = 'react-pill'; p.innerHTML = `${s} ${d.reactions[s].length > 1 ? `<small>${d.reactions[s].length}</small>` : ''}`; l.appendChild(p); } }
+    function renderReacts(mid) { const el = document.getElementById(mid); const d = msgData.get(mid); if (!el || !d) return; let l = el.querySelector('.reactions-list'); if (!l) { l = document.createElement('div'); l.className = 'reactions-list'; el.appendChild(l); } l.innerHTML = ''; for (const s in d.reactions) if (d.reactions[s].length > 0) { const p = document.createElement('div'); p.className = 'react-pill'; p.innerHTML = `${s} ${d.reactions[s].length > 1 ? `<small>${d.reactions[s].length}</small>` : ''}`; l.appendChild(p); } }
     function openReact(e, mid) { e.stopPropagation(); closeReact(); const b = document.createElement('div'); b.className = 'reaction-bar'; SYMBOLS.forEach(s => { const o = document.createElement('span'); o.className = 'react-opt'; o.textContent = s; o.onclick = (ev) => { ev.stopPropagation(); socket.send(JSON.stringify({ type: 'reaction', messageId: mid, reactor: currentUser, symbol: s })); closeReact(); }; b.appendChild(o); }); const r = e.currentTarget.getBoundingClientRect(); b.style.left = `${Math.max(10, Math.min(window.innerWidth - 200, r.left))}px`; b.style.top = `${r.top > 100 ? r.top - 50 : r.bottom + 10}px`; document.body.appendChild(b); reactionMenu = b; }
     function closeReact() { if (reactionMenu) { reactionMenu.remove(); reactionMenu = null; } }
     function handleTyping(t) { if (t !== isTyping) { isTyping = t; socket.send(JSON.stringify({ type: 'typing', isTyping: t })); } clearTimeout(typingTimer); if (t) typingTimer = setTimeout(() => handleTyping(false), 3000); }
@@ -287,7 +339,7 @@
         if (messages.length <= MAX_DOM_MESSAGES) return;
         const toRemove = messages.slice(0, messages.length - MAX_DOM_MESSAGES);
         toRemove.forEach(el => {
-            const mid = el.id.replace('m-', '');
+            const mid = el.id;
             const data = msgData.get(mid);
             if (data?.url) { URL.revokeObjectURL(data.url); objectUrls.delete(data.url); }
             msgData.delete(mid);

@@ -76,7 +76,6 @@ async function processBinaryQueue() {
     const targets = Array.from(wss.clients).filter(c => c.readyState === WebSocket.OPEN);
     const start = Date.now();
 
-    // Inform clients that a binary transfer is coming so they can show "Receiving..."
     broadcastJson({ type: 'transfer_incoming', meta });
 
     for (const client of targets) {
@@ -84,18 +83,14 @@ async function processBinaryQueue() {
 
         let clientWaitStart = Date.now();
         while (client.bufferedAmount > BACKPRESSURE_THRESHOLD) {
-            if (Date.now() - clientWaitStart > 10000) break; // Don't hang forever for one client
+            if (Date.now() - clientWaitStart > 10000) break;
             await new Promise(r => setTimeout(r, 100));
         }
 
-        // Send payload as a single message to ensure integrity and fix 16KB truncation
         client.send(payload, { binary: true, compress: false });
-
-        // Small yield to let event loop breathe between large sends
         await new Promise(res => setImmediate(res));
     }
 
-    // Success broadcast
     broadcastJson({ type: 'transfer_progress', messageId: meta.id, percent: 100 });
 
     payload = null;
@@ -158,7 +153,15 @@ wss.on('connection', (ws) => {
             if (msg.type === 'chat') {
                 info.isTyping = false;
                 broadcastTypingStatus();
-                broadcastJson({ type: 'chat', id: 'm-' + Date.now(), sender: info.username, text: msg.text, timestamp: Date.now() });
+                // Honor the client-generated ID to prevent double-message rendering
+                const msgId = msg.id || 'm-' + Date.now();
+                broadcastJson({
+                    type: 'chat',
+                    id: msgId,
+                    sender: info.username,
+                    text: msg.text,
+                    timestamp: Date.now()
+                });
             } else if (msg.type === 'typing') {
                 info.isTyping = msg.isTyping;
                 broadcastTypingStatus();

@@ -189,10 +189,14 @@ body {
     display: flex;
     justify-content: flex-end;
     align-items: center;
-    gap: 8px;
+    gap: 4px;
     margin-top: 4px;
-    opacity: 0.6;
+    opacity: 0.8;
     font-size: 0.65rem;
+}
+
+.timestamp {
+    color: var(--dim);
 }
 
 .delete-btn {
@@ -201,13 +205,33 @@ body {
     color: var(--alert);
     cursor: pointer;
     font-weight: bold;
+    margin-right: 4px;
 }
+
+.status-ticks {
+    display: flex;
+    align-items: center;
+    height: 12px;
+}
+
+.tick-icon {
+    width: 14px;
+    height: 14px;
+    color: var(--dim);
+}
+
+.msg-right .tick-icon.delivered {
+    color: #53bdeb;
+}
+
+/* light blue for delivered/seen in LAN context */
 
 .message img {
     max-width: 100%;
     border-radius: 6px;
     margin: 6px 0;
     display: block;
+    cursor: pointer;
 }
 
 .file-card {
@@ -395,23 +419,24 @@ audio {
 /* Progress Styling */
 .progress-container {
     width: 100%;
-    height: 3px;
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 3px;
+    height: 4px;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
     margin-top: 8px;
     overflow: hidden;
+    position: relative;
 }
 
 .progress-bar-fill {
     height: 100%;
     background: var(--accent);
     width: 0%;
-    transition: width 0.3s ease-out;
+    transition: width 0.2s linear;
 }
 
 .progress-badge {
-    font-size: 0.6rem;
-    color: var(--accent);
+    font-size: 0.65rem;
+    color: var(--dim);
     font-weight: bold;
     margin-top: 4px;
     display: block;
@@ -420,7 +445,7 @@ audio {
 }
 
 .is-loading {
-    opacity: 0.7;
+    opacity: 0.8;
 }
 
 .placeholder-content {
