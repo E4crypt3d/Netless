@@ -1,11 +1,10 @@
 # Netless LAN Chat
 
-A private, secure, and blazing-fast local chat server for your home or office network. No internet required, no data leaves your network.
+A private local chat server for your home or office network. No internet required, no data leaves your network.
 
 ## Features
 - 🔒 **Private & Secure**: Self-signed HTTPS encryption.
 - 🚀 **High Performance**: Real-time messaging and binary (file) broadcasting via WebSockets.
-- 💾 **No Logs**: Messages are not stored on the server (except user profile nicknames).
 - 📱 **Multi-platform**: Works on any device with a modern web browser.
 
 ---
@@ -22,7 +21,7 @@ A private, secure, and blazing-fast local chat server for your home or office ne
     ```
 5.  **Start Server**:
     ```bash
-    npm start
+    node server.js
     ```
 
 ### 📱 Termux (Android)
@@ -45,7 +44,7 @@ A private, secure, and blazing-fast local chat server for your home or office ne
     ```
 5.  **Start Server**:
     ```bash
-    npm start
+    node server.js
     ```
 
 ### 🐧 Linux (Ubuntu/Debian)
@@ -60,7 +59,7 @@ A private, secure, and blazing-fast local chat server for your home or office ne
     ```
 3.  **Start Server**:
     ```bash
-    npm start
+    node server.js
     ```
 
 ### 🍎 macOS
@@ -74,7 +73,7 @@ A private, secure, and blazing-fast local chat server for your home or office ne
     ```
 3.  **Start Server**:
     ```bash
-    npm start
+    node server.js
     ```
 
 ---
