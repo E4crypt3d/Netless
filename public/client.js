@@ -2,6 +2,7 @@
 (() => {
     let socket;
     let currentUser = '';
+    let iAmAdmin = false;
     let isTyping = false, typingTimer = null;
     let isRecording = false, recCanceled = false, recStartPos = null;
     let mediaRecorder = null, audioChunks = [], recStartTime = 0, timerInt = null;
@@ -27,8 +28,12 @@
     const nameLabel = document.getElementById('display-name');
     const fileIn = document.getElementById('file-input');
     const statusLight = document.getElementById('status-light');
+    const networkInfo = document.getElementById('network-info');
+    const onlineToggle = document.getElementById('online-toggle');
+    const onlineContainer = document.getElementById('online-list-container');
+    const onlineList = document.getElementById('online-users-list');
 
-    const TICK_CLOCK = `<svg class="tick-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22C6.47,22 2,17.5 2,12A10,10 0 0,1 12,2M12.5,7V12.25L17,14.92L16.25,16.15L11,13V7H12.5Z" /></svg>`;
+    const TICK_CLOCK = `<svg class="tick-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4A8,8 0 0,0 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22C6.47,22 2,17.5 2,12A10,10 0 0,1 12,2M12.5,7V12.25L17,14.92L16.25,16.15L11,13V7H12.5Z" /></svg>`;
     const TICK_SINGLE = `<svg class="tick-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z" /></svg>`;
     const TICK_DOUBLE = `<svg class="tick-icon delivered" viewBox="0 0 24 24"><path fill="currentColor" d="M0.41,13.41L6,19L7.41,17.58L1.83,12M22.24,5.58L11.66,16.17L7.5,12L6.07,13.41L11.66,19L23.66,7M18,7L16.59,5.58L10.24,11.93L11.66,13.34L18,7Z" /></svg>`;
 
@@ -57,6 +62,30 @@
     function handleJson(msg) {
         switch (msg.type) {
             case 'identity_confirmed': currentUser = msg.username; nameLabel.textContent = msg.username; break;
+            case 'admin_status':
+                iAmAdmin = msg.isAdmin;
+                nameLabel.innerHTML = `${currentUser} <span class="admin-badge-small">ADMIN</span>`;
+                document.querySelectorAll('.message').forEach(el => {
+                    const mid = el.id;
+                    const meta = el.querySelector('.message-meta');
+                    if (meta && !meta.querySelector('.delete-btn')) {
+                        const d = document.createElement('button');
+                        d.className = 'delete-btn'; d.textContent = '✕';
+                        d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: mid })); };
+                        meta.insertBefore(d, meta.firstChild);
+                    }
+                });
+                break;
+            case 'online_users':
+                networkInfo.textContent = `${msg.users.length} Online`;
+                onlineList.innerHTML = '';
+                msg.users.forEach(u => {
+                    const item = document.createElement('div');
+                    item.className = 'online-user-item';
+                    item.innerHTML = `<div class="status-dot"></div><span>${u.username}</span>${u.isAdmin ? '<span class="admin-badge-small">ADMIN</span>' : ''}`;
+                    onlineList.appendChild(item);
+                });
+                break;
             case 'chat':
                 const existing = document.getElementById(msg.id);
                 if (existing) {
@@ -75,12 +104,9 @@
             case 'transfer_progress':
                 const el = document.getElementById(msg.messageId);
                 const isMe = el && el.classList.contains('msg-right');
-
-                // Only show/update progress bar for the sender
                 if (isMe) {
                     updateProgress(msg.messageId, msg.percent, msg.percent < 100 ? "Broadcasting" : "Sent");
                 }
-
                 if (msg.percent >= 100) {
                     updateMsgStatus(msg.messageId, 'delivered');
                 }
@@ -96,7 +122,32 @@
                 const delEl = document.getElementById(msg.messageId);
                 if (delEl) { const d = msgData.get(msg.messageId); if (d?.url) URL.revokeObjectURL(d.url); msgData.delete(msg.messageId); delEl.remove(); }
                 break;
+            case 'edit_broadcast':
+                const editEl = document.getElementById(msg.messageId);
+                if (editEl) {
+                    const p = editEl.querySelector('p');
+                    if (p) {
+                        p.textContent = msg.newText;
+                        if (!editEl.querySelector('.edited-label')) {
+                            const lbl = document.createElement('small');
+                            lbl.className = 'edited-label'; lbl.textContent = '(edited by admin)';
+                            p.appendChild(lbl);
+                        }
+                    }
+                }
+                break;
             case 'reaction': updateReaction(msg); break;
+        }
+    }
+
+    function editMessage(mid) {
+        const el = document.getElementById(mid);
+        const p = el.querySelector('p');
+        if (!p) return;
+        const currentText = p.textContent.replace('(edited by admin)', '').trim();
+        const newText = prompt("Edit message text:", currentText);
+        if (newText !== null && newText.trim() !== "" && newText !== currentText) {
+            socket.send(JSON.stringify({ type: 'edit', messageId: mid, newText: newText.trim() }));
         }
     }
 
@@ -137,7 +188,9 @@
         };
         document.getElementById('edit-btn').onclick = () => { document.getElementById('user-info').classList.add('hidden'); const f = document.getElementById('edit-form'); f.classList.remove('hidden'); const i = document.getElementById('name-input'); i.value = currentUser; i.focus(); };
         document.getElementById('save-btn').onclick = () => { const v = document.getElementById('name-input').value.trim(); if (v && socket.readyState === 1) socket.send(JSON.stringify({ type: 'rename', name: v })); document.getElementById('edit-form').classList.add('hidden'); document.getElementById('user-info').classList.remove('hidden'); };
-        window.onclick = () => closeReact();
+
+        onlineToggle.onclick = (e) => { e.stopPropagation(); onlineContainer.classList.toggle('hidden'); };
+        window.onclick = () => { closeReact(); onlineContainer.classList.add('hidden'); };
     }
 
     async function startRec() {
@@ -206,13 +259,9 @@
     function updateProgress(mid, percent, label) {
         const el = document.getElementById(mid);
         if (!el) return;
-
-        // Safety check: Only show progress for uploader
         if (!el.classList.contains('msg-right')) return;
-
         let bar = el.querySelector('.progress-bar-fill');
         let badge = el.querySelector('.progress-badge');
-
         if (!bar) {
             const container = document.createElement('div');
             container.className = 'progress-container';
@@ -220,15 +269,12 @@
             bar.className = 'progress-bar-fill';
             container.appendChild(bar);
             el.appendChild(container);
-
             badge = document.createElement('div');
             badge.className = 'progress-badge';
             el.appendChild(badge);
         }
-
         bar.style.width = percent + '%';
         badge.textContent = `${label || "Uploading"} ${percent}%`;
-
         if (percent >= 100) {
             setTimeout(() => {
                 bar.parentElement?.remove();
@@ -243,7 +289,6 @@
         const meta = JSON.parse(new TextDecoder().decode(buf.slice(4, 4 + mLen)));
         const blob = new Blob([buf.slice(4 + mLen)], { type: meta.mime });
         const url = URL.createObjectURL(blob); objectUrls.add(url);
-
         const existing = document.getElementById(meta.id);
         if (existing) {
             const content = meta.type === 'voice' ? createVoiceContent(url) : createFileContent(meta, url);
@@ -262,29 +307,35 @@
         const isMe = m.sender === currentUser;
         const div = document.createElement('div'); div.id = m.id; div.className = `message ${isMe ? 'msg-right' : 'msg-left'}`;
         if (m.loading) div.classList.add('is-loading');
-
         div.onclick = (e) => openReact(e, m.id);
         if (!msgData.has(m.id)) msgData.set(m.id, { reactions: {} });
-        const n = document.createElement('span'); n.className = 'sender-name'; n.textContent = isMe ? 'You' : m.sender; n.style.color = getHashColor(m.sender); div.appendChild(n);
-
+        const n = document.createElement('span'); n.className = 'sender-name';
+        n.innerHTML = `${isMe ? 'You' : m.sender}${m.isAdmin ? ' <span class="admin-badge-small">ADMIN</span>' : ''}`;
+        n.style.color = getHashColor(m.sender); div.appendChild(n);
         if (m.size) {
             const sz = document.createElement('small'); sz.className = 'file-size'; sz.textContent = ` (${formatSize(m.size)})`; sz.style.opacity = '0.5'; sz.style.fontSize = '0.6rem';
             n.appendChild(sz);
         }
-
         const meta = document.createElement('div'); meta.className = 'message-meta';
         const t = document.createElement('span'); t.className = 'timestamp'; t.textContent = new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); meta.appendChild(t);
 
+        if (isMe || iAmAdmin) {
+            const d = document.createElement('button'); d.className = 'delete-btn'; d.textContent = '✕'; d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: m.id })); };
+            meta.insertBefore(d, meta.firstChild);
+
+            if (iAmAdmin && !m.type || m.type === 'chat') {
+                const editBtn = document.createElement('button');
+                editBtn.className = 'edit-btn-inline'; editBtn.innerHTML = '✎';
+                editBtn.onclick = (e) => { e.stopPropagation(); editMessage(m.id); };
+                meta.insertBefore(editBtn, meta.firstChild);
+            }
+        }
         if (isMe) {
             const ticks = document.createElement('span');
             ticks.className = 'status-ticks';
             ticks.innerHTML = m.status === 'pending' ? TICK_CLOCK : TICK_SINGLE;
             meta.appendChild(ticks);
-
-            const d = document.createElement('button'); d.className = 'delete-btn'; d.textContent = '✕'; d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: m.id })); };
-            meta.insertBefore(d, t);
         }
-
         div.appendChild(meta); return div;
     }
 

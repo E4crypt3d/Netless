@@ -45,7 +45,7 @@ body {
     justify-content: space-between;
     align-items: center;
     border-bottom: 1px solid #2f3b43;
-    z-index: 10;
+    z-index: 100;
 }
 
 .header-left {
@@ -66,6 +66,11 @@ body {
     box-shadow: 0 0 8px var(--accent);
 }
 
+.title-group {
+    cursor: pointer;
+    user-select: none;
+}
+
 .title-group h1 {
     font-size: 1rem;
     font-weight: 600;
@@ -73,8 +78,44 @@ body {
 
 .title-group span {
     font-size: 0.6rem;
-    color: var(--dim);
+    color: var(--accent);
     display: block;
+}
+
+.online-list-container {
+    position: absolute;
+    top: 65px;
+    left: 16px;
+    background: #111b21;
+    border: 1px solid #2f3b43;
+    border-radius: 8px;
+    width: 200px;
+    padding: 8px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+    z-index: 200;
+}
+
+.online-list-header {
+    font-size: 0.7rem;
+    color: var(--dim);
+    margin-bottom: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #2f3b43;
+}
+
+.online-user-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    padding: 4px 0;
+}
+
+.status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
 }
 
 .identity-section {
@@ -208,6 +249,16 @@ body {
     margin-right: 4px;
 }
 
+.edit-btn-inline {
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    font-weight: bold;
+    margin-right: 4px;
+    font-size: 0.8rem;
+}
+
 .status-ticks {
     display: flex;
     align-items: center;
@@ -223,8 +274,6 @@ body {
 .msg-right .tick-icon.delivered {
     color: #53bdeb;
 }
-
-/* light blue for delivered/seen in LAN context */
 
 .message img {
     max-width: 100%;
@@ -375,6 +424,27 @@ audio {
     color: var(--dim);
     text-transform: uppercase;
     margin: 4px 0;
+}
+
+/* Admin Features */
+.admin-badge-small {
+    background: #ffd700;
+    color: #000;
+    font-size: 0.6rem;
+    padding: 1px 4px;
+    border-radius: 4px;
+    font-weight: 900;
+    margin-left: 4px;
+    vertical-align: middle;
+    box-shadow: 0 0 5px rgba(255, 215, 0, 0.5);
+}
+
+.edited-label {
+    display: block;
+    font-size: 0.6rem;
+    color: var(--dim);
+    margin-top: 2px;
+    font-style: italic;
 }
 
 /* Reaction Overlay */

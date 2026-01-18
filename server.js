@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 3000;
 const USERS_FILE = path.resolve(__dirname, 'users.json');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
 const CERT_DIR = path.resolve(__dirname, 'certs');
+const ADMIN_PASS = "netlessadmin";
 
 const isLowResource = process.env.PREFIX?.includes('com.termux') || os.arch().startsWith('arm');
 const BACKPRESSURE_THRESHOLD = isLowResource ? 64 * 1024 : 1024 * 1024;
@@ -74,7 +75,6 @@ async function processBinaryQueue() {
 
     let { payload, meta } = binaryBroadcastQueue.shift();
     const targets = Array.from(wss.clients).filter(c => c.readyState === WebSocket.OPEN);
-    const start = Date.now();
 
     broadcastJson({ type: 'transfer_incoming', meta });
 
@@ -125,6 +125,14 @@ async function broadcastJson(data, exclude = null) {
     }
 }
 
+function broadcastOnlineUsers() {
+    const users = Array.from(clients.values()).map(c => ({
+        username: c.username,
+        isAdmin: c.isAdmin
+    }));
+    broadcastJson({ type: 'online_users', users });
+}
+
 wss.on('connection', (ws) => {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
@@ -141,9 +149,10 @@ wss.on('connection', (ws) => {
                 const users = getUsers();
                 if (!users[msg.uid]) { users[msg.uid] = generateRandomName(); saveUsers(users); }
                 const username = users[msg.uid];
-                clients.set(ws, { uid: msg.uid, username, isTyping: false });
+                clients.set(ws, { uid: msg.uid, username, isTyping: false, isAdmin: false });
                 ws.send(JSON.stringify({ type: 'identity_confirmed', username }));
                 broadcastJson({ type: 'system', text: `${username} joined` }, ws);
+                broadcastOnlineUsers();
                 return;
             }
 
@@ -151,14 +160,27 @@ wss.on('connection', (ws) => {
             if (!info) return;
 
             if (msg.type === 'chat') {
+                if (msg.text.startsWith('/admin')) {
+                    if (msg.text.startsWith('/admin ')) {
+                        const pass = msg.text.substring(7).trim();
+                        if (pass === ADMIN_PASS) {
+                            info.isAdmin = true;
+                            ws.send(JSON.stringify({ type: 'admin_status', isAdmin: true }));
+                            broadcastJson({ type: 'system', text: `${info.username} is now an ADMIN` });
+                            broadcastOnlineUsers();
+                        }
+                    }
+                    return;
+                }
+
                 info.isTyping = false;
                 broadcastTypingStatus();
-                // Honor the client-generated ID to prevent double-message rendering
                 const msgId = msg.id || 'm-' + Date.now();
                 broadcastJson({
                     type: 'chat',
                     id: msgId,
                     sender: info.username,
+                    isAdmin: info.isAdmin,
                     text: msg.text,
                     timestamp: Date.now()
                 });
@@ -174,8 +196,19 @@ wss.on('connection', (ws) => {
                     broadcastJson({ type: 'system', text: `${old} is now ${next}` });
                     ws.send(JSON.stringify({ type: 'name_updated', name: next }));
                     broadcastTypingStatus();
+                    broadcastOnlineUsers();
                 }
-            } else if (msg.type === 'delete' || msg.type === 'reaction') {
+            } else if (msg.type === 'delete') {
+                broadcastJson(msg);
+            } else if (msg.type === 'edit') {
+                if (info.isAdmin) {
+                    broadcastJson({
+                        type: 'edit_broadcast',
+                        messageId: msg.messageId,
+                        newText: msg.newText
+                    });
+                }
+            } else if (msg.type === 'reaction') {
                 broadcastJson(msg);
             }
         } catch (e) { }
@@ -187,6 +220,7 @@ wss.on('connection', (ws) => {
             broadcastJson({ type: 'system', text: `${info.username} left` });
             clients.delete(ws);
             broadcastTypingStatus();
+            broadcastOnlineUsers();
         }
     });
 });

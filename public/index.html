@@ -16,11 +16,17 @@
         <header class="main-header">
             <div class="header-left">
                 <div id="status-light" class="status-light"></div>
-                <div class="title-group">
+                <div class="title-group" id="online-toggle">
                     <h1>Netless</h1>
-                    <span id="network-info">LAN Mode</span>
+                    <span id="network-info">Connecting...</span>
                 </div>
             </div>
+
+            <div id="online-list-container" class="online-list-container hidden">
+                <div class="online-list-header">Online Participants</div>
+                <div id="online-users-list"></div>
+            </div>
+
             <div id="identity-section" class="identity-section">
                 <div id="user-info" class="user-info">
                     <span id="display-name">...</span>
