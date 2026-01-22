@@ -323,7 +323,8 @@
             const d = document.createElement('button'); d.className = 'delete-btn'; d.textContent = '✕'; d.onclick = (e) => { e.stopPropagation(); socket.send(JSON.stringify({ type: 'delete', messageId: m.id })); };
             meta.insertBefore(d, meta.firstChild);
 
-            if (iAmAdmin && !m.type || m.type === 'chat') {
+            if (iAmAdmin && m.type === 'chat') {
+
                 const editBtn = document.createElement('button');
                 editBtn.className = 'edit-btn-inline'; editBtn.innerHTML = '✎';
                 editBtn.onclick = (e) => { e.stopPropagation(); editMessage(m.id); };

@@ -1,4 +1,3 @@
-
 const express = require('express');
 const https = require('https');
 const WebSocket = require('ws');
@@ -7,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const selfsigned = require('selfsigned');
 const os = require('os');
+const { exec, spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,9 +15,150 @@ const PUBLIC_DIR = path.resolve(__dirname, 'public');
 const CERT_DIR = path.resolve(__dirname, 'certs');
 const ADMIN_PASS = "netlessadmin";
 
-const isLowResource = process.env.PREFIX?.includes('com.termux') || os.arch().startsWith('arm');
+const IS_TERMUX = process.env.PREFIX?.includes('com.termux') ||
+    fs.existsSync('/data/data/com.termux/files/usr/bin/bash') ||
+    os.userInfo().homedir.includes('com.termux');
+const isLowResource = IS_TERMUX || os.arch().startsWith('arm');
 const BACKPRESSURE_THRESHOLD = isLowResource ? 64 * 1024 : 1024 * 1024;
 const SEND_TIMEOUT = 60000;
+
+class TermuxOptimizer {
+    constructor() {
+        this.wakelockActive = false;
+        this.notificationActive = false;
+        this.keepAliveInterval = null;
+
+        if (IS_TERMUX) {
+            console.log('🔋 Termux detected - enabling battery optimization bypass...');
+            this.setupOptimizations();
+        }
+    }
+
+    setupOptimizations() {
+        this.tryDisableBatteryOptimization();
+        this.setupWakelock();
+        this.setupNotification();
+        this.startKeepAlive();
+        this.increasePriority();
+    }
+
+    tryDisableBatteryOptimization() {
+        const commands = [
+            'termux-battery-optimization -i',
+            'settings put global app_standby_enabled 0',
+            'dumpsys deviceidle whitelist +com.termux'
+        ];
+
+        commands.forEach(cmd => {
+            exec(cmd, (error) => {
+                if (!error) console.log(`✓ ${cmd.split(' ')[0]} executed`);
+            });
+        });
+    }
+
+    setupWakelock() {
+        exec('which termux-wake-lock', (err, stdout) => {
+            if (!err && stdout.includes('termux-wake-lock')) {
+                exec('termux-wake-lock NetlessServer', (err) => {
+                    if (!err) {
+                        this.wakelockActive = true;
+                        console.log('✓ Wakelock acquired');
+
+                        process.on('exit', () => {
+                            exec('termux-wake-unlock NetlessServer');
+                        });
+                    }
+                });
+            } else {
+                console.log('⚠ termux-wake-lock not found, using fallback');
+            }
+        });
+    }
+
+    setupNotification() {
+        exec('which termux-notification', (err, stdout) => {
+            if (!err && stdout.includes('termux-notification')) {
+                const notifCmd = [
+                    'termux-notification',
+                    '--id', 'netless_server',
+                    '--title', 'Netless LAN Chat',
+                    '--content', `Server running on port ${PORT}`,
+                    '--ongoing',
+                    '--priority', 'max',
+                    '--button1', 'Stop',
+                    '--button1-action', `pkill -f "node ${__filename}" && termux-notification --id netless_server --cancel`
+                ].join(' ');
+
+                exec(notifCmd, (err) => {
+                    if (!err) {
+                        this.notificationActive = true;
+                        console.log('✓ Persistent notification created');
+                    }
+                });
+            }
+        });
+    }
+
+    startKeepAlive() {
+        this.keepAliveInterval = setInterval(() => {
+            try {
+                fs.appendFileSync('/tmp/netless_keepalive.log',
+                    `${new Date().toISOString()}\n`);
+            } catch (e) { }
+
+            const dgram = require('dgram');
+            const socket = dgram.createSocket('udp4');
+            socket.bind(() => {
+                socket.close();
+            });
+
+            if (this.notificationActive) {
+                exec(`termux-notification --id netless_server --content "Active: ${new Date().toLocaleTimeString()}"`,
+                    () => { });
+            }
+
+            console.log(`[KeepAlive] ${new Date().toLocaleTimeString()}`);
+        }, 15000); // 15 seconds
+    }
+
+    increasePriority() {
+        try {
+            if (process.setPriority) {
+                process.setPriority(10); // High priority
+            }
+            if (os.platform() !== 'win32') {
+                process.setuid?.(process.getuid?.());
+            }
+        } catch (e) {
+        }
+    }
+
+    cleanup() {
+        if (this.keepAliveInterval) {
+            clearInterval(this.keepAliveInterval);
+        }
+
+        if (this.wakelockActive) {
+            exec('termux-wake-unlock NetlessServer', () => { });
+        }
+
+        if (this.notificationActive) {
+            exec('termux-notification --id netless_server --cancel', () => { });
+        }
+    }
+}
+
+const termuxOptimizer = new TermuxOptimizer();
+
+process.on('exit', () => termuxOptimizer.cleanup());
+process.on('SIGINT', () => {
+    termuxOptimizer.cleanup();
+    process.exit();
+});
+process.on('SIGTERM', () => {
+    termuxOptimizer.cleanup();
+    process.exit();
+});
 
 if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
@@ -238,6 +379,20 @@ setInterval(() => {
     });
 }, 30000);
 
+// Auto-restart mechanism for Termux if process gets killed
+if (IS_TERMUX) {
+    process.on('uncaughtException', (err) => {
+        console.error('Uncaught exception, restarting:', err.message);
+        setTimeout(() => {
+            require('child_process').exec(`node "${__filename}"`, {
+                cwd: __dirname,
+                detached: true,
+                stdio: 'ignore'
+            });
+        }, 1000);
+    });
+}
+
 const interfaces = os.networkInterfaces();
 const addresses = [];
 for (let k in interfaces) {
@@ -248,6 +403,16 @@ for (let k in interfaces) {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`\nNETLESS: LAN Chat Server - [Mode: ${isLowResource ? 'TERMUX' : 'NORMAL'}]`);
-    addresses.forEach(ip => console.log(`LAN: https://${ip}:${PORT}`));
+    console.log(`\n🚀 NETLESS: LAN Chat Server - [Mode: ${IS_TERMUX ? 'TERMUX' : 'NORMAL'}]`);
+    console.log(`📱 Battery optimization bypass: ${IS_TERMUX ? 'ACTIVE' : 'Not needed'}`);
+    addresses.forEach(ip => console.log(`🌐 LAN: https://${ip}:${PORT}`));
+    console.log(`🔒 HTTPS with self-signed cert (accept warning in browser)`);
+
+    // Extra Termux instructions
+    if (IS_TERMUX) {
+        console.log('\n📋 For best Termux experience:');
+        console.log('1. Keep Termux in foreground or use "Termux:Widget"');
+        console.log('2. If killed, it will auto-restart');
+        console.log('3. Notification shows server status');
+    }
 });
