@@ -224,7 +224,7 @@
                 const url = URL.createObjectURL(finalBlob);
                 objectUrls.add(url);
                 entry.url = url;
-                entry.chunks = []
+                entry.chunks = [];
 
                 const existing = document.getElementById(mid);
                 if (existing) {
