@@ -1,418 +1,263 @@
-const express = require('express');
-const https = require('https');
-const WebSocket = require('ws');
-const compression = require('compression');
-const fs = require('fs');
-const path = require('path');
-const selfsigned = require('selfsigned');
-const os = require('os');
-const { exec, spawn } = require('child_process');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const fastify = require('fastify');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const selfsigned = require('selfsigned');
+
 const USERS_FILE = path.resolve(__dirname, 'users.json');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
 const CERT_DIR = path.resolve(__dirname, 'certs');
-const ADMIN_PASS = "netlessadmin";
-
-const IS_TERMUX = process.env.PREFIX?.includes('com.termux') ||
-    fs.existsSync('/data/data/com.termux/files/usr/bin/bash') ||
-    os.userInfo().homedir.includes('com.termux');
-const isLowResource = IS_TERMUX || os.arch().startsWith('arm');
-const BACKPRESSURE_THRESHOLD = isLowResource ? 64 * 1024 : 1024 * 1024;
-const SEND_TIMEOUT = 60000;
-
-class TermuxOptimizer {
-    constructor() {
-        this.wakelockActive = false;
-        this.notificationActive = false;
-        this.keepAliveInterval = null;
-
-        if (IS_TERMUX) {
-            console.log('🔋 Termux detected - enabling battery optimization bypass...');
-            this.setupOptimizations();
-        }
-    }
-
-    setupOptimizations() {
-        this.tryDisableBatteryOptimization();
-        this.setupWakelock();
-        this.setupNotification();
-        this.startKeepAlive();
-        this.increasePriority();
-    }
-
-    tryDisableBatteryOptimization() {
-        const commands = [
-            'termux-battery-optimization -i',
-            'settings put global app_standby_enabled 0',
-            'dumpsys deviceidle whitelist +com.termux'
-        ];
-
-        commands.forEach(cmd => {
-            exec(cmd, (error) => {
-                if (!error) console.log(`✓ ${cmd.split(' ')[0]} executed`);
-            });
-        });
-    }
-
-    setupWakelock() {
-        exec('which termux-wake-lock', (err, stdout) => {
-            if (!err && stdout.includes('termux-wake-lock')) {
-                exec('termux-wake-lock NetlessServer', (err) => {
-                    if (!err) {
-                        this.wakelockActive = true;
-                        console.log('✓ Wakelock acquired');
-
-                        process.on('exit', () => {
-                            exec('termux-wake-unlock NetlessServer');
-                        });
-                    }
-                });
-            } else {
-                console.log('⚠ termux-wake-lock not found, using fallback');
-            }
-        });
-    }
-
-    setupNotification() {
-        exec('which termux-notification', (err, stdout) => {
-            if (!err && stdout.includes('termux-notification')) {
-                const notifCmd = [
-                    'termux-notification',
-                    '--id', 'netless_server',
-                    '--title', 'Netless LAN Chat',
-                    '--content', `Server running on port ${PORT}`,
-                    '--ongoing',
-                    '--priority', 'max',
-                    '--button1', 'Stop',
-                    '--button1-action', `pkill -f "node ${__filename}" && termux-notification --id netless_server --cancel`
-                ].join(' ');
-
-                exec(notifCmd, (err) => {
-                    if (!err) {
-                        this.notificationActive = true;
-                        console.log('✓ Persistent notification created');
-                    }
-                });
-            }
-        });
-    }
-
-    startKeepAlive() {
-        this.keepAliveInterval = setInterval(() => {
-            try {
-                fs.appendFileSync('/tmp/netless_keepalive.log',
-                    `${new Date().toISOString()}\n`);
-            } catch (e) { }
-
-            const dgram = require('dgram');
-            const socket = dgram.createSocket('udp4');
-            socket.bind(() => {
-                socket.close();
-            });
-
-            if (this.notificationActive) {
-                exec(`termux-notification --id netless_server --content "Active: ${new Date().toLocaleTimeString()}"`,
-                    () => { });
-            }
-
-            console.log(`[KeepAlive] ${new Date().toLocaleTimeString()}`);
-        }, 15000); // 15 seconds
-    }
-
-    increasePriority() {
-        try {
-            if (process.setPriority) {
-                process.setPriority(10); // High priority
-            }
-            if (os.platform() !== 'win32') {
-                process.setuid?.(process.getuid?.());
-            }
-        } catch (e) {
-        }
-    }
-
-    cleanup() {
-        if (this.keepAliveInterval) {
-            clearInterval(this.keepAliveInterval);
-        }
-
-        if (this.wakelockActive) {
-            exec('termux-wake-unlock NetlessServer', () => { });
-        }
-
-        if (this.notificationActive) {
-            exec('termux-notification --id netless_server --cancel', () => { });
-        }
-    }
-}
-
-const termuxOptimizer = new TermuxOptimizer();
-
-process.on('exit', () => termuxOptimizer.cleanup());
-process.on('SIGINT', () => {
-    termuxOptimizer.cleanup();
-    process.exit();
-});
-process.on('SIGTERM', () => {
-    termuxOptimizer.cleanup();
-    process.exit();
-});
+const ADMIN_PASS = "f00t=ba11";
 
 if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify({}));
 
-let credentials = {};
+function getLocalIPs() {
+    const nets = os.networkInterfaces();
+    const ips = [];
+    for (const name of Object.keys(nets)) {
+        for (const net of nets[name]) {
+            if (net.family === 'IPv4' && !net.internal) ips.push(net.address);
+        }
+    }
+    return ips;
+}
+
+const ADJECTIVES = ["Quantum", "Neon", "Spectral", "Cyber", "Zenith", "Silent", "Hidden", "Azure", "Golden", "Iron", "Vivid", "Primal", "Void", "Coded", "Lunar", "Alpha", "Omega", "Sonic", "Static"];
+const NOUNS = ["Cipher", "Falcon", "Nomad", "Shadow", "Ray", "Pulse", "Cortex", "Zenith", "Spark", "Orbit", "Echo", "Atlas", "Sentry", "Vector", "Ghost", "Titan", "Vanguard", "Apex", "Wraith"];
+
+function generateCoolName() {
+    const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
+    const noun = NOUNS[Math.floor(Math.random() * NOUNS.length)];
+    return `${adj} ${noun}`;
+}
+
 const keyPath = path.join(CERT_DIR, 'key.pem');
 const certPath = path.join(CERT_DIR, 'cert.pem');
-
-function generateCerts() {
-    const attrs = [{ name: 'commonName', value: 'netless.lan' }];
-    const pems = selfsigned.generate(attrs, { days: 365, keySize: 2048, algorithm: 'sha256' });
-    fs.writeFileSync(keyPath, pems.private);
-    fs.writeFileSync(certPath, pems.cert);
-    return { key: pems.private, cert: pems.cert };
-}
+let credentials = {};
 
 if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
     credentials = { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
 } else {
-    credentials = generateCerts();
+    console.log("[SSL] Generating Root-Level LAN Certificate...");
+    const ips = getLocalIPs();
+    const altNames = ips.map(ip => ({ type: 7, ip }));
+    altNames.push({ type: 2, value: 'localhost' }, { type: 7, ip: '127.0.0.1' });
+
+    const pems = selfsigned.generate([{ name: 'commonName', value: 'NetlessLAN' }], {
+        days: 365,
+        keySize: 2048,
+        algorithm: 'sha256',
+        extensions: [
+            { name: 'basicConstraints', cA: true },
+            { name: 'subjectAltName', altNames }
+        ]
+    });
+    fs.writeFileSync(keyPath, pems.private);
+    fs.writeFileSync(certPath, pems.cert);
+    credentials = { key: pems.private, cert: pems.cert };
 }
 
-const server = https.createServer(credentials, app);
-const wss = new WebSocket.Server({
-    server,
-    maxPayload: 30 * 1024 * 1024
+const app = fastify({
+    logger: false,
+    https: credentials,
+    disableRequestLogging: true,
+    keepAliveTimeout: 120000,
+    connectionTimeout: 60000
 });
 
-function getUsers() {
-    try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) { return {}; }
-}
-
-function saveUsers(users) {
-    try { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2)); } catch (e) { console.error('Save failed', e); }
-}
-
-function generateRandomName() {
-    const adj = ['Swift', 'Quiet', 'Bright', 'Bold', 'Calm', 'Deep', 'Fast', 'Kind', 'Zesty', 'Solar'];
-    const noun = ['Panda', 'Eagle', 'River', 'Mountain', 'Cloud', 'Stone', 'Leaf', 'Star', 'Falcon', 'Tide'];
-    return `${adj[Math.floor(Math.random() * adj.length)]}${noun[Math.floor(Math.random() * noun.length)]}`;
-}
-
-app.use(compression());
-app.use(express.static(PUBLIC_DIR));
-app.use(express.json());
+app.register(require('@fastify/websocket'), {
+    options: {
+        maxPayload: 100 * 1024 * 1024, // 100MB max support
+        clientTracking: true,
+        perMessageDeflate: false
+    }
+});
 
 const clients = new Map();
-const binaryBroadcastQueue = [];
-let isProcessingBinary = false;
 
-async function processBinaryQueue() {
-    if (isProcessingBinary || binaryBroadcastQueue.length === 0) return;
-    isProcessingBinary = true;
-
-    let { payload, meta } = binaryBroadcastQueue.shift();
-    const targets = Array.from(wss.clients).filter(c => c.readyState === WebSocket.OPEN);
-
-    broadcastJson({ type: 'transfer_incoming', meta });
-
-    for (const client of targets) {
-        if (client.readyState !== WebSocket.OPEN) continue;
-
-        let clientWaitStart = Date.now();
-        while (client.bufferedAmount > BACKPRESSURE_THRESHOLD) {
-            if (Date.now() - clientWaitStart > 10000) break;
-            await new Promise(r => setTimeout(r, 100));
-        }
-
-        client.send(payload, { binary: true, compress: false });
-        await new Promise(res => setImmediate(res));
-    }
-
-    broadcastJson({ type: 'transfer_progress', messageId: meta.id, percent: 100 });
-
-    payload = null;
-    isProcessingBinary = false;
-    setImmediate(processBinaryQueue);
-}
-
-function broadcastBinarySafely(data) {
-    try {
-        const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        const mLen = dv.getUint32(0);
-        const meta = JSON.parse(new TextDecoder().decode(data.slice(4, 4 + mLen)));
-
-        binaryBroadcastQueue.push({ payload: data, meta });
-        data = null;
-
-        while (binaryBroadcastQueue.length > 2) binaryBroadcastQueue.shift();
-        processBinaryQueue();
-    } catch (e) {
-        console.error("Binary metadata extraction failed", e);
-    }
-}
-
-async function broadcastJson(data, exclude = null) {
+function broadcast(data, exclude = null) {
     const payload = JSON.stringify(data);
-    for (const client of wss.clients) {
-        if (client !== exclude && client.readyState === WebSocket.OPEN) {
-            if (client.bufferedAmount < BACKPRESSURE_THRESHOLD) {
-                client.send(payload);
-            }
+    for (const [conn] of clients.entries()) {
+        if (conn !== exclude && conn.socket.readyState === 1) {
+            try { conn.socket.send(payload); } catch (e) { }
         }
     }
 }
 
-function broadcastOnlineUsers() {
-    const users = Array.from(clients.values()).map(c => ({
-        username: c.username,
-        isAdmin: c.isAdmin
-    }));
-    broadcastJson({ type: 'online_users', users });
+function sendOnlineList() {
+    const uniqueUsers = new Map();
+    for (const info of clients.values()) {
+        if (!uniqueUsers.has(info.uid)) {
+            uniqueUsers.set(info.uid, {
+                username: info.username,
+                isAdmin: info.isAdmin
+            });
+        }
+    }
+    broadcast({ type: 'online_users', users: Array.from(uniqueUsers.values()) });
 }
 
-wss.on('connection', (ws) => {
-    ws.isAlive = true;
-    ws.on('pong', () => { ws.isAlive = true; });
+app.register(async function (fastify) {
+    fastify.get('/ws', { websocket: true }, (connection, req) => {
+        req.socket.setNoDelay(true);
+        connection.socket.isAlive = true;
+        connection.socket.on('pong', () => { connection.socket.isAlive = true; });
 
-    ws.on('message', (data, isBinary) => {
-        if (isBinary) {
-            broadcastBinarySafely(Buffer.isBuffer(data) ? data : Buffer.from(data));
-            return;
-        }
+        connection.socket.on('message', (data, isBinary) => {
+            if (isBinary) {
+                try {
+                    const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+                    const mLen = dv.getUint32(0);
+                    const meta = JSON.parse(new TextDecoder().decode(data.slice(4, 4 + mLen)));
 
-        try {
-            const msg = JSON.parse(data.toString());
-            if (msg.type === 'identify') {
-                const users = getUsers();
-                if (!users[msg.uid]) { users[msg.uid] = generateRandomName(); saveUsers(users); }
-                const username = users[msg.uid];
-                clients.set(ws, { uid: msg.uid, username, isTyping: false, isAdmin: false });
-                ws.send(JSON.stringify({ type: 'identity_confirmed', username }));
-                broadcastJson({ type: 'system', text: `${username} joined` }, ws);
-                broadcastOnlineUsers();
+                    // Only broadcast "incoming" signal on the very first chunk to avoid spamming clients
+                    if (meta.chunkIndex === 0) {
+                        broadcast({ type: 'transfer_incoming', meta }, connection);
+                    }
+
+                    // Efficiently relay binary data
+                    for (const [client] of clients) {
+                        if (client !== connection && client.socket.readyState === 1) {
+                            try { client.socket.send(data, { binary: true }); } catch (e) {
+                                clients.delete(client);
+                                client.socket.terminate();
+                            }
+                        }
+                    }
+
+                    // Completion signal only on the last chunk
+                    if (meta.chunkIndex === (meta.totalChunks - 1)) {
+                        broadcast({ type: 'transfer_progress', messageId: meta.id, percent: 100 });
+                    }
+                } catch (e) {
+                    console.error("[BINARY RELAY ERR]", e);
+                }
                 return;
             }
 
-            const info = clients.get(ws);
-            if (!info) return;
+            try {
+                const msg = JSON.parse(data.toString());
+                const info = clients.get(connection);
 
-            if (msg.type === 'chat') {
-                if (msg.text.startsWith('/admin')) {
-                    if (msg.text.startsWith('/admin ')) {
-                        const pass = msg.text.substring(7).trim();
-                        if (pass === ADMIN_PASS) {
-                            info.isAdmin = true;
-                            ws.send(JSON.stringify({ type: 'admin_status', isAdmin: true }));
-                            broadcastJson({ type: 'system', text: `${info.username} is now an ADMIN` });
-                            broadcastOnlineUsers();
+                if (msg.type === 'identify') {
+                    for (const [conn, existing] of clients.entries()) {
+                        if (existing.uid === msg.uid && conn !== connection) {
+                            try { conn.socket.terminate(); } catch (e) { }
+                            clients.delete(conn);
                         }
                     }
+
+                    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8') || '{}');
+                    if (!users[msg.uid]) {
+                        users[msg.uid] = generateCoolName();
+                    }
+                    fs.writeFileSync(USERS_FILE, JSON.stringify(users));
+
+                    const username = users[msg.uid];
+                    clients.set(connection, { uid: msg.uid, username, isAdmin: false, isTyping: false });
+
+                    connection.socket.send(JSON.stringify({ type: 'identity_confirmed', username }));
+                    broadcast({ type: 'system', text: `${username} joined` }, connection);
+                    sendOnlineList();
                     return;
                 }
 
-                info.isTyping = false;
-                broadcastTypingStatus();
-                const msgId = msg.id || 'm-' + Date.now();
-                broadcastJson({
-                    type: 'chat',
-                    id: msgId,
-                    sender: info.username,
-                    isAdmin: info.isAdmin,
-                    text: msg.text,
-                    timestamp: Date.now()
-                });
-            } else if (msg.type === 'typing') {
-                info.isTyping = msg.isTyping;
-                broadcastTypingStatus();
-            } else if (msg.type === 'rename') {
-                const old = info.username;
-                const next = msg.name.trim().substring(0, 15);
-                if (next && next !== old) {
-                    const users = getUsers();
-                    info.username = next; users[info.uid] = next; saveUsers(users);
-                    broadcastJson({ type: 'system', text: `${old} is now ${next}` });
-                    ws.send(JSON.stringify({ type: 'name_updated', name: next }));
-                    broadcastTypingStatus();
-                    broadcastOnlineUsers();
-                }
-            } else if (msg.type === 'delete') {
-                broadcastJson(msg);
-            } else if (msg.type === 'edit') {
-                if (info.isAdmin) {
-                    broadcastJson({
-                        type: 'edit_broadcast',
-                        messageId: msg.messageId,
-                        newText: msg.newText
-                    });
-                }
-            } else if (msg.type === 'reaction') {
-                broadcastJson(msg);
-            }
-        } catch (e) { }
-    });
+                if (!info) return;
 
-    ws.on('close', () => {
-        const info = clients.get(ws);
-        if (info) {
-            broadcastJson({ type: 'system', text: `${info.username} left` });
-            clients.delete(ws);
-            broadcastTypingStatus();
-            broadcastOnlineUsers();
-        }
+                switch (msg.type) {
+                    case 'chat':
+                        if (msg.text.startsWith('/admin ') && msg.text.endsWith(ADMIN_PASS)) {
+                            info.isAdmin = true;
+                            connection.socket.send(JSON.stringify({ type: 'admin_status', isAdmin: true }));
+                            broadcast({ type: 'system', text: `${info.username} promoted to Admin` });
+                            sendOnlineList();
+                        } else {
+                            broadcast({
+                                type: 'chat',
+                                id: msg.id || 'm-' + Date.now(),
+                                sender: info.username,
+                                isAdmin: info.isAdmin,
+                                text: msg.text,
+                                timestamp: Date.now()
+                            });
+                        }
+                        info.isTyping = false;
+                        updateTyping();
+                        break;
+                    case 'delete':
+                        if (info.isAdmin || msg.sender === info.username) broadcast(msg);
+                        break;
+                    case 'edit':
+                        if (info.isAdmin) {
+                            broadcast({ type: 'edit_broadcast', messageId: msg.messageId, newText: msg.newText });
+                        }
+                        break;
+                    case 'reaction':
+                        broadcast({ type: 'reaction', messageId: msg.messageId, reactor: info.username, symbol: msg.symbol });
+                        break;
+                    case 'typing':
+                        info.isTyping = msg.isTyping;
+                        updateTyping();
+                        break;
+                    case 'rename':
+                        const old = info.username;
+                        const next = msg.name.trim().substring(0, 15);
+                        if (next && next !== old) {
+                            const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8') || '{}');
+                            info.username = next;
+                            users[info.uid] = next;
+                            fs.writeFileSync(USERS_FILE, JSON.stringify(users));
+                            broadcast({ type: 'system', text: `${old} is now ${next}` });
+                            connection.socket.send(JSON.stringify({ type: 'name_updated', name: next }));
+                            sendOnlineList();
+                        }
+                        break;
+                }
+            } catch (e) { console.error("[WS MSG ERR]", e); }
+        });
+
+        connection.socket.on('close', () => {
+            const info = clients.get(connection);
+            if (info) {
+                broadcast({ type: 'system', text: `${info.username} disconnected` });
+                clients.delete(connection);
+                sendOnlineList();
+                updateTyping();
+            }
+        });
     });
 });
 
-function broadcastTypingStatus() {
-    const users = Array.from(clients.values()).filter(c => c.isTyping).map(c => c.username);
-    broadcastJson({ type: 'typing_update', users });
+function updateTyping() {
+    const typingUsers = Array.from(clients.values())
+        .filter(c => c.isTyping)
+        .map(c => c.username);
+    broadcast({ type: 'typing_update', users: typingUsers });
 }
+
+app.register(require('@fastify/static'), {
+    root: PUBLIC_DIR,
+    prefix: '/'
+});
 
 setInterval(() => {
-    wss.clients.forEach(ws => {
-        if (ws.isAlive === false) return ws.terminate();
-        ws.isAlive = false;
-        ws.ping();
-    });
-}, 30000);
-
-// Auto-restart mechanism for Termux if process gets killed
-if (IS_TERMUX) {
-    process.on('uncaughtException', (err) => {
-        console.error('Uncaught exception, restarting:', err.message);
-        setTimeout(() => {
-            require('child_process').exec(`node "${__filename}"`, {
-                cwd: __dirname,
-                detached: true,
-                stdio: 'ignore'
-            });
-        }, 1000);
-    });
-}
-
-const interfaces = os.networkInterfaces();
-const addresses = [];
-for (let k in interfaces) {
-    for (let k2 in interfaces[k]) {
-        let addr = interfaces[k][k2];
-        if (addr.family === 'IPv4' && !addr.internal) addresses.push(addr.address);
+    for (const [conn] of clients.entries()) {
+        if (conn.socket.isAlive === false) {
+            clients.delete(conn);
+            return conn.socket.terminate();
+        }
+        conn.socket.isAlive = false;
+        try { conn.socket.ping(); } catch (e) { }
     }
-}
+}, 20000);
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 NETLESS: LAN Chat Server - [Mode: ${IS_TERMUX ? 'TERMUX' : 'NORMAL'}]`);
-    console.log(`📱 Battery optimization bypass: ${IS_TERMUX ? 'ACTIVE' : 'Not needed'}`);
-    addresses.forEach(ip => console.log(`🌐 LAN: https://${ip}:${PORT}`));
-    console.log(`🔒 HTTPS with self-signed cert (accept warning in browser)`);
-
-    // Extra Termux instructions
-    if (IS_TERMUX) {
-        console.log('\n📋 For best Termux experience:');
-        console.log('1. Keep Termux in foreground or use "Termux:Widget"');
-        console.log('2. If killed, it will auto-restart');
-        console.log('3. Notification shows server status');
-    }
+const PORT = 3000;
+app.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
+    if (err) { console.error(err); process.exit(1); }
+    const ips = getLocalIPs();
+    console.log(`\nNETLESS FRAGMENTED LAN\n========================`);
+    ips.forEach(ip => console.log(`LINK: https://${ip}:${PORT}`));
 });
