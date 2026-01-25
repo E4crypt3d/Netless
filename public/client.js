@@ -10,13 +10,12 @@
 
     const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-    // FRAGMENTATION SETTINGS (1MB chunks)
     const CHUNK_SIZE = 1024 * 1024;
     const MAX_DOM_MESSAGES = isMobile ? 40 : 300;
     const BACKPRESSURE_LIMIT = isMobile ? 4 * 1024 * 1024 : 16 * 1024 * 1024;
     const SEND_TIMEOUT = 600000;
 
-    const msgData = new Map(); // Stores message data including incoming chunks
+    const msgData = new Map();
     const objectUrls = new Set();
     const MAX_FILE = 100 * 1024 * 1024;
     const SYMBOLS = ['❤️', '⭐', '🔥', '😂', '❓'];
@@ -147,10 +146,7 @@
             case 'reaction': updateReaction(msg); break;
         }
     }
-
-    /**
-     * FRAGMENTED BINARY SEND (CHUNKING)
-     */
+    // chunking
     async function sendBin(meta, data) {
         if (socket.readyState !== 1) return;
 
@@ -174,10 +170,9 @@
             const len = new Uint8Array(4);
             new DataView(len.buffer).setUint32(0, mBuf.length);
 
-            // Send as Blob to avoid extra memory allocation of ArrayBuffer
             const pkg = new Blob([len, mBuf, slice]);
 
-            // Responsive Backpressure
+            // backpressure
             while (socket.readyState === 1 && socket.bufferedAmount > BACKPRESSURE_LIMIT) {
                 await new Promise(r => setTimeout(r, 50));
             }
@@ -185,7 +180,6 @@
             if (socket.readyState === 1) {
                 socket.send(pkg);
 
-                // Throttle UI updates to 10 FPS during transfer to keep main thread fluid
                 const now = Date.now();
                 if (now - lastUiUpdate > 100 || i === totalChunks - 1) {
                     const percent = Math.floor(((i + 1) / totalChunks) * 100);
@@ -201,9 +195,6 @@
         }
     }
 
-    /**
-     * FRAGMENTED BINARY RECEIVE (REASSEMBLY)
-     */
     function handleBinary(buf) {
         try {
             const dv = new DataView(buf);
@@ -222,7 +213,6 @@
             const receivedChunks = entry.chunks.filter(x => x).length;
             const now = Date.now();
 
-            // Throttle receiving progress UI
             if (now - entry.lastUpdate > 150 || receivedChunks === chunkMeta.totalChunks) {
                 const percent = Math.floor((receivedChunks / chunkMeta.totalChunks) * 100);
                 updateProgress(mid, percent, "Receiving");
@@ -234,7 +224,7 @@
                 const url = URL.createObjectURL(finalBlob);
                 objectUrls.add(url);
                 entry.url = url;
-                entry.chunks = []; // Immediate GC
+                entry.chunks = []
 
                 const existing = document.getElementById(mid);
                 if (existing) {
@@ -281,7 +271,6 @@
             el.appendChild(badge);
         }
 
-        // Use requestAnimationFrame for smooth UI
         requestAnimationFrame(() => {
             bar.style.width = percent + '%';
             badge.textContent = `${label} ${percent}%`;

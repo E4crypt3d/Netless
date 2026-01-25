@@ -426,7 +426,6 @@ audio {
     margin: 4px 0;
 }
 
-/* Admin Features */
 .admin-badge-small {
     background: #ffd700;
     color: #000;
@@ -447,7 +446,6 @@ audio {
     font-style: italic;
 }
 
-/* Reaction Overlay */
 .reaction-bar {
     position: fixed;
     background: #2a3942;
@@ -486,7 +484,6 @@ audio {
     font-size: 0.7rem;
 }
 
-/* Progress Styling */
 .progress-container {
     width: 100%;
     height: 4px;

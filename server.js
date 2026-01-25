@@ -8,7 +8,7 @@ const selfsigned = require('selfsigned');
 const USERS_FILE = path.resolve(__dirname, 'users.json');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
 const CERT_DIR = path.resolve(__dirname, 'certs');
-const ADMIN_PASS = "f00t=ba11";
+const ADMIN_PASS = "netlessadmin";
 
 if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
@@ -70,7 +70,7 @@ const app = fastify({
 
 app.register(require('@fastify/websocket'), {
     options: {
-        maxPayload: 100 * 1024 * 1024, // 100MB max support
+        maxPayload: 100 * 1024 * 1024, // 100MB
         clientTracking: true,
         perMessageDeflate: false
     }
@@ -113,12 +113,10 @@ app.register(async function (fastify) {
                     const mLen = dv.getUint32(0);
                     const meta = JSON.parse(new TextDecoder().decode(data.slice(4, 4 + mLen)));
 
-                    // Only broadcast "incoming" signal on the very first chunk to avoid spamming clients
                     if (meta.chunkIndex === 0) {
                         broadcast({ type: 'transfer_incoming', meta }, connection);
                     }
 
-                    // Efficiently relay binary data
                     for (const [client] of clients) {
                         if (client !== connection && client.socket.readyState === 1) {
                             try { client.socket.send(data, { binary: true }); } catch (e) {
@@ -128,7 +126,6 @@ app.register(async function (fastify) {
                         }
                     }
 
-                    // Completion signal only on the last chunk
                     if (meta.chunkIndex === (meta.totalChunks - 1)) {
                         broadcast({ type: 'transfer_progress', messageId: meta.id, percent: 100 });
                     }
